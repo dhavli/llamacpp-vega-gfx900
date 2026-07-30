@@ -4,6 +4,18 @@ State after round 2 (commit 1e6b91f, runtime store `pk52zfmn...`): TG 18.65, pp5
 Decode budget 53.6 ms/token = ~33 ms matvec + ~15-20 ms small-op dispatch swarm.
 
 ## (a) TG: fuse delta-net elementwise chains (est. −8-12 ms/token)
+Implementation entry points (ggml-vulkan.cpp, prism clone):
+- Fusion detection chain: ~line 15808-15861 (`ggml_vk_can_fuse(ctx, cgraph, i, {...})`
+  else-if ladder inside graph build) — add `{GGML_OP_UNARY(SIGMOID), GGML_OP_MUL}` case here.
+- Matcher template: `ggml_vk_can_fuse_ssm_conv` at :15331 (checks ggml_can_fuse + type/
+  contiguity/misalign guards; require sigmoid-out consumed only by the mul, same shapes).
+- Generic matcher: `ggml_vk_can_fuse` at :15177.
+- Dispatch uses `ctx->num_additional_fused_ops` + dst = `cgraph->nodes[node_idx + n_fused]`
+  (see RMS_NORM_MUL dispatch ~:8960 for the two-tensor fused pattern).
+- Shader: new `sigmoid_mul.comp` (elementwise dst = sigmoid(a)*b), or extend glu.comp.
+- The out-ids GET_ROWS at n==1 is ALREADY skipped by the fork (guard in qwen35.cpp:216 +
+  llama-graph.cpp:242) — the 97 GET_ROWS/token are all state-cache reads (GDN-with-ids
+  fusion needed, heavier).
 Source of truth: `src/models/qwen35.cpp` in the prism clone (scratchpad) — per layer:
 - `ggml_mul(cur, ggml_sigmoid(ctx0, gate))` at ~line 708 → SIGMOID+MUL fusion (pattern like
   RMS_NORM_MUL; matcher framework at `ggml_vk_can_fuse` ggml-vulkan.cpp:15177, examples:
