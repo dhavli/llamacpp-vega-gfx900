@@ -3,7 +3,11 @@
 State after round 2 (commit 1e6b91f, runtime store `pk52zfmn...`): TG 18.65, pp512 141.1.
 Decode budget 53.6 ms/token = ~33 ms matvec + ~15-20 ms small-op dispatch swarm.
 
-## (a) TG: fuse delta-net elementwise chains (est. −8-12 ms/token)
+## (a) TG: fuse delta-net elementwise chains — SIGMOID+MUL DONE (perf-neutral, v9)
+The scan-based matcher + sigglu shader landed; fires 16×/token (attention gates only),
+bit-identical, neutral timing. The remaining dispatch swarm is the 48 delta-net layers:
+GET_ROWS×2/SCALE/CPY/L2_NORM×2/CONCAT per layer — requires GDN-integrated state indexing
+(pass ids into GATED_DELTA_NET and index inside; graph + shader change).
 Implementation entry points (ggml-vulkan.cpp, prism clone):
 - Fusion detection chain: ~line 15808-15861 (`ggml_vk_can_fuse(ctx, cgraph, i, {...})`
   else-if ladder inside graph build) — add `{GGML_OP_UNARY(SIGMOID), GGML_OP_MUL}` case here.
@@ -29,10 +33,11 @@ Source of truth: `src/models/qwen35.cpp` in the prism clone (scratchpad) — per
 - Note: GGML_SCHED_DEBUG=2 prints nothing in the release build; to get the exact node
   sequence use a debug build or add a graph-print in ggml_vk_graph_compute.
 
-## (b) PP: mul_mm LDS double-buffering (est. +15-25%)
-mul_mm.comp block loop: load_a/load_b → barrier → math → barrier, ~160 iterations of
-full pipeline drain. Double-buffer buf_a/buf_b (2× shmem: 2×16.9 KB at BM128/BN64 fits) and
-prefetch tile k+1 during math on tile k. pk-issue efficiency currently 41%.
+## (b) PP: mul_mm LDS double-buffering — DONE, FALSIFIED (patch v10)
+Implemented as GGML_VK_MM_DBUF (2× LDS tiles, one barrier/tile): 133.1 vs 138.0 at the
+128×64 tile — the doubled shared memory halves WG occupancy per CU, costing more than the
+saved barrier drains. Correct output; knob retained. mul_mm micro-opt space is exhausted at
+pp512 141.1; further PP would need persistent kernels or int8-B with v_mad_i32_i24 emulation.
 
 ## (c) TG: generic n=2..8 dmmv is slow (740 µs vs 113 µs n=1 for 8× work)
 The SoA generic path (dequantize/get_dm per 4-8 weights) is byte-era code; a wide-style
