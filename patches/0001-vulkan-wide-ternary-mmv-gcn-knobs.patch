@@ -1,4 +1,4 @@
-From 6964cbeb133274f1a24d771cb24a12907e53352f Mon Sep 17 00:00:00 2001
+From 53fbcce92dced2e3236aa55102d1ce29ac27d85a Mon Sep 17 00:00:00 2001
 From: Donach's Bot <bot@braiins.cz>
 Date: Thu, 30 Jul 2026 19:09:57 +0200
 Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
@@ -18,20 +18,20 @@ Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
 - GGML_VK_TILE_{L,M,S}: runtime warptile override (11 csv uints) for the
   dequant mmq pipelines, wg_denoms follow BM/BN.
 ---
- ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 362 +++++++++++++++++-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 369 +++++++++++++++++-
  .../vulkan-shaders/dequant_funcs.glsl         |  32 ++
  .../vulkan-shaders/mul_mat_vec.comp           | 181 ++++++++-
  .../vulkan-shaders/mul_mat_vec_iface.glsl     |   7 +
- .../ggml-vulkan/vulkan-shaders/mul_mm.comp    |  55 ++-
- .../vulkan-shaders/mul_mm_funcs.glsl          |   5 +
+ .../ggml-vulkan/vulkan-shaders/mul_mm.comp    | 132 ++++++-
+ .../vulkan-shaders/mul_mm_funcs.glsl          | 181 ++++-----
  .../ggml-vulkan/vulkan-shaders/sigglu.comp    |  37 ++
  .../src/ggml-vulkan/vulkan-shaders/types.glsl |  18 +
- .../vulkan-shaders/vulkan-shaders-gen.cpp     |  98 +++++
- 9 files changed, 776 insertions(+), 19 deletions(-)
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     | 103 +++++
+ 9 files changed, 947 insertions(+), 113 deletions(-)
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/sigglu.comp
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index fd22aba..a40485a 100644
+index fd22aba..39f356e 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -751,6 +751,9 @@ struct vk_device_struct {
@@ -138,7 +138,7 @@ index fd22aba..a40485a 100644
          for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
              ggml_type t = (ggml_type)i;
              // Disable medium and large matrix multiplication if not enough shared memory is available
-@@ -4253,8 +4329,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4253,8 +4329,36 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
  
          CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
  
@@ -148,7 +148,12 @@ index fd22aba..a40485a 100644
 +        // binary/ternary quants to the packed-k shaders (PACKED_K in
 +        // mul_mm.comp): one v_pk_fma_f16 per k-pair instead of two scalar
 +        // f16 fmas, which GCN executes at fp32 rate.
-+        if (getenv("GGML_VK_MM_PACKED") != nullptr) {
++        if (getenv("GGML_VK_MM_PACKED") != nullptr && getenv("GGML_VK_MM_DBUF") != nullptr) {
++            CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f16acc, matmul_q1_0_f32_pk_db, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f32acc, matmul_q1_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f16acc, matmul_q2_0_f32_pk, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f32acc, matmul_q2_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        } else if (getenv("GGML_VK_MM_PACKED") != nullptr) {
 +            CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f16acc, matmul_q1_0_f32_pk, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
 +            CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f32acc, matmul_q1_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
 +            CREATE_MM(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f16acc, matmul_q2_0_f32_pk, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -160,7 +165,9 @@ index fd22aba..a40485a 100644
 +
 +        // SoA-repacked Q1_0 mul_mm pipelines (GGML_VK_TERNARY_SOA=1).
 +        if (ggml_vk_ternary_soa_enabled()) {
-+            if (getenv("GGML_VK_MM_PACKED") != nullptr) {
++            if (getenv("GGML_VK_MM_PACKED") != nullptr && getenv("GGML_VK_MM_DBUF") != nullptr) {
++                CREATE_MM(GGML_TYPE_Q1_0, pipeline_mul_mat_soa_q1_0.f16acc, matmul_q1_0_f32_pk_soa_db, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            } else if (getenv("GGML_VK_MM_PACKED") != nullptr) {
 +                CREATE_MM(GGML_TYPE_Q1_0, pipeline_mul_mat_soa_q1_0.f16acc, matmul_q1_0_f32_pk_soa, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
 +            } else {
 +                CREATE_MM(GGML_TYPE_Q1_0, pipeline_mul_mat_soa_q1_0.f16acc, matmul_q1_0_f32_soa, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -170,7 +177,7 @@ index fd22aba..a40485a 100644
          CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
          CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
          CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0], matmul_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
-@@ -4567,8 +4664,42 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4567,8 +4671,42 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          rm_stdq_int = 2;
      }
      uint32_t rm_iq = 2 * rm_kq;
@@ -215,7 +222,7 @@ index fd22aba..a40485a 100644
      // Ensure a subgroup size >= 16 is available
      const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
  
-@@ -4596,8 +4727,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4596,8 +4734,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -229,7 +236,7 @@ index fd22aba..a40485a 100644
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f32_f32", arr_dmmv_q4_0_f32_f32_len[reduc], arr_dmmv_q4_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f32_f32", arr_dmmv_q4_1_f32_f32_len[reduc], arr_dmmv_q4_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f32_f32", arr_dmmv_q5_0_f32_f32_len[reduc], arr_dmmv_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-@@ -4623,8 +4757,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4623,8 +4764,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f16_f32",  arr_dmmv_f32_f16_f32_len[reduc],  arr_dmmv_f32_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -243,7 +250,7 @@ index fd22aba..a40485a 100644
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f16_f32", arr_dmmv_q4_0_f16_f32_len[reduc], arr_dmmv_q4_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f16_f32", arr_dmmv_q4_1_f16_f32_len[reduc], arr_dmmv_q4_1_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f16_f32", arr_dmmv_q5_0_f16_f32_len[reduc], arr_dmmv_q5_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-@@ -4676,8 +4813,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4676,8 +4820,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_F32 ], "mul_mat_vec_id_f32_f32",        arr_dmmv_id_f32_f32_f32_len[reduc],     arr_dmmv_id_f32_f32_f32_data[reduc],     "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1, 1, 1}, {wg_size_subgroup, 1}, 1, false, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_F16 ], "mul_mat_vec_id_f16_f32",        arr_dmmv_id_f16_f32_f32_len[reduc],     arr_dmmv_id_f16_f32_f32_data[reduc],     "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_BF16], "mul_mat_vec_id_bf16_f32",       arr_dmmv_id_bf16_f32_f32_len[reduc],    arr_dmmv_id_bf16_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
@@ -254,7 +261,7 @@ index fd22aba..a40485a 100644
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_f32",       arr_dmmv_id_q4_0_f32_f32_len[reduc],    arr_dmmv_id_q4_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_1], "mul_mat_vec_id_q4_1_f32",       arr_dmmv_id_q4_1_f32_f32_len[reduc],    arr_dmmv_id_q4_1_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q5_0], "mul_mat_vec_id_q5_0_f32",       arr_dmmv_id_q5_0_f32_f32_len[reduc],    arr_dmmv_id_q5_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
-@@ -5026,6 +5163,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -5026,6 +5170,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
      CREATE_GLU(geglu)
      CREATE_GLU(reglu)
      CREATE_GLU(swiglu)
@@ -262,7 +269,7 @@ index fd22aba..a40485a 100644
      CREATE_GLU(swiglu_oai)
      CREATE_GLU(geglu_erf)
      CREATE_GLU(geglu_quick)
-@@ -6780,8 +6918,12 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type
+@@ -6780,8 +6925,12 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type
      return ctx->device->pipeline_dequant[type];
  }
  
@@ -276,7 +283,7 @@ index fd22aba..a40485a 100644
      if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
          return ctx->device->pipeline_matmul_f32;
      }
-@@ -6861,7 +7003,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
+@@ -6861,7 +7010,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
      return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
  }
  
@@ -285,7 +292,7 @@ index fd22aba..a40485a 100644
      VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
      GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
      GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
-@@ -6943,6 +7085,16 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+@@ -6943,6 +7092,16 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
          return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
      }
  
@@ -302,7 +309,7 @@ index fd22aba..a40485a 100644
      return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
  }
  
-@@ -8243,7 +8395,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+@@ -8243,7 +8402,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
  
      if (mmp == nullptr) {
          // Fall back to f16 dequant mul mat
@@ -311,7 +318,7 @@ index fd22aba..a40485a 100644
          quantize_y = false;
      }
  
-@@ -8584,7 +8736,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+@@ -8584,7 +8743,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
  
      if (dmmv == nullptr) {
          // Fall back to f16 dequant mul mat
@@ -320,7 +327,7 @@ index fd22aba..a40485a 100644
          quantize_y = false;
      }
  
-@@ -10323,6 +10475,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -10323,6 +10482,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
              return nullptr;
          }
  
@@ -332,7 +339,7 @@ index fd22aba..a40485a 100644
          switch (ggml_get_glu_op(dst)) {
              case GGML_GLU_OP_GEGLU:
                  return ctx->device->pipeline_geglu[dst->type == GGML_TYPE_F16];
-@@ -10859,6 +11016,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+@@ -10859,6 +11023,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
  
          } break;
      case GGML_OP_GET_ROWS:
@@ -340,7 +347,7 @@ index fd22aba..a40485a 100644
          elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
          elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
          elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-@@ -12072,6 +12230,39 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
+@@ -12072,6 +12237,39 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
          });
  }
  
@@ -380,7 +387,7 @@ index fd22aba..a40485a 100644
  static void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
      int32_t * op_params = (int32_t *)dst->op_params;
      ggml_vk_op_f32<vk_op_diag_mask_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_DIAG_MASK_INF, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0] });
-@@ -14066,6 +14257,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+@@ -14066,6 +14264,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
              break;
          }
  
@@ -393,7 +400,7 @@ index fd22aba..a40485a 100644
          switch (ggml_get_unary_op(node)) {
          case GGML_UNARY_OP_ELU:
          case GGML_UNARY_OP_EXP:
-@@ -14487,6 +14684,21 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
+@@ -14487,6 +14691,21 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
          return;
      }
  
@@ -415,7 +422,7 @@ index fd22aba..a40485a 100644
      ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
  }
  
-@@ -14501,6 +14713,7 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
+@@ -14501,6 +14720,7 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
          return;
      }
  
@@ -423,7 +430,7 @@ index fd22aba..a40485a 100644
      ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
  }
  
-@@ -14727,6 +14940,34 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
+@@ -14727,6 +14947,34 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
          return;
      }
  
@@ -458,7 +465,7 @@ index fd22aba..a40485a 100644
      ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
  
      vk_context cpy_ctx;
-@@ -15134,6 +15375,81 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
+@@ -15134,6 +15382,81 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
  }
  
  // Match SSM_CONV + UNARY(SILU) or SSM_CONV + ADD + UNARY(SILU). num_extra is 1 or 2.
@@ -540,7 +547,7 @@ index fd22aba..a40485a 100644
  static bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                        int node_idx, int num_extra) {
      const ggml_tensor * conv = cgraph->nodes[node_idx];
-@@ -15528,6 +15844,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -15528,6 +15851,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
      // Reserve tensor context space for all nodes
      ctx->tensor_ctxs.resize(cgraph->n_nodes);
  
@@ -559,7 +566,7 @@ index fd22aba..a40485a 100644
      bool first_node_in_batch = true; // true if next node will be first node in a batch
      int submit_node_idx = 0; // index to first node in a batch
  
-@@ -15664,6 +15992,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -15664,6 +15999,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                  // they are overwritten, and one workgroup per row. So close enough.
                  op_srcs_fused_elementwise[0] = true;
                  op_srcs_fused_elementwise[1] = true;
@@ -870,7 +877,7 @@ index e8d053c..20163df 100644
  layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
  #ifdef B_TYPEV2
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
-index 89346e4..3d9bde9 100644
+index 89346e4..9d2bdb9 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
 @@ -62,6 +62,18 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
@@ -903,7 +910,31 @@ index 89346e4..3d9bde9 100644
  #else
  layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working with a quant
  #define BK_STEP 2
-@@ -258,8 +274,21 @@ void main() {
+@@ -125,8 +141,23 @@ layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working wit
+ #define SHMEM_STRIDE (BK / 2 + 1)
+ #endif
+ 
++#if defined(MM_DBUF)
++#if defined(COOPMAT)
++#error "MM_DBUF is only implemented for the scalar path"
++#endif
++// Double-buffered tiles: loads for tile k+1 issue before the math on tile k,
++// so their latency hides under the fmas and only one barrier per tile is
++// needed. Loaders write at lds_off_*; the math reads the other half.
++shared FLOAT_TYPEV2 buf_a[2 * BM * SHMEM_STRIDE];
++shared FLOAT_TYPEV2 buf_b[2 * BN * SHMEM_STRIDE];
++uint lds_off_a = 0;
++uint lds_off_b = 0;
++#else
+ shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
+ shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
++const uint lds_off_a = 0;
++const uint lds_off_b = 0;
++#endif
+ 
+ #define NUM_WARPS (BLOCK_SIZE / WARP)
+ 
+@@ -258,8 +289,21 @@ void main() {
          sums[i] = coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
      }
  #else
@@ -926,7 +957,7 @@ index 89346e4..3d9bde9 100644
      FLOAT_TYPEV4 cache_a[WMITER * TM];
      FLOAT_TYPEV4 cache_b;
  #else
-@@ -267,7 +296,7 @@ void main() {
+@@ -267,12 +311,59 @@ void main() {
      FLOAT_TYPEV2 cache_b;
  #endif
  
@@ -935,25 +966,94 @@ index 89346e4..3d9bde9 100644
          sums[i] = ACC_TYPEV2(0.0f, 0.0f);
      }
  #endif
-@@ -307,7 +336,7 @@ void main() {
+ 
++#if defined(MM_DBUF)
++    // prologue: fetch the first tile into half 0
++    {
++        const uint block = start_k;
++        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
++            load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
++        }
++        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
++#if !defined(MUL_MAT_ID)
++            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
++#else
++            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
++#endif
++        }
++        pos_a += BK / LOAD_VEC_A;
++        pos_b += BK / LOAD_VEC_B;
++    }
++    uint lds_t = 0;
++    for (uint block = start_k; block < end_k; block += BK) {
++        // one barrier per tile: joins the loads of this tile and the previous
++        // tile's math (which read the half we are about to overwrite)
++        barrier();
++
++        const uint lds_rd_a = lds_t * (BM * SHMEM_STRIDE);
++        const uint lds_rd_b = lds_t * (BN * SHMEM_STRIDE);
++
++        if (block + BK < end_k) {
++            lds_off_a = (lds_t ^ 1u) * (BM * SHMEM_STRIDE);
++            lds_off_b = (lds_t ^ 1u) * (BN * SHMEM_STRIDE);
++            const uint nblock = block + BK;
++            [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
++                load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, nblock, end_k);
++            }
++            [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
++#if !defined(MUL_MAT_ID)
++                load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, nblock, end_k);
++#else
++                load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, nblock, end_k);
++#endif
++            }
++            pos_a += BK / LOAD_VEC_A;
++            pos_b += BK / LOAD_VEC_B;
++        }
++        lds_t ^= 1u;
++#else
+     for (uint block = start_k; block < end_k; block += BK) {
++        const uint lds_rd_a = 0;
++        const uint lds_rd_b = 0;
+         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
+         }
+@@ -288,6 +379,7 @@ void main() {
+ 
+         pos_a += BK / LOAD_VEC_A;
+         pos_b += BK / LOAD_VEC_B;
++#endif
+ 
+ #ifdef COOPMAT
+         [[unroll]] for (uint i = 0; i < BK; i += TK) {
+@@ -307,25 +399,33 @@ void main() {
              // Load from shared into cache
              [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                  [[unroll]] for (uint j = 0; j < TM; j++) {
 -                #if defined(DATA_A_F32) || defined(DATA_A_F16)
+-                    cache_a[wsir * TM + j].xy = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i    ];
+-                    cache_a[wsir * TM + j].zw = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i + 1];
 +                #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(PACKED_K)
-                     cache_a[wsir * TM + j].xy = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i    ];
-                     cache_a[wsir * TM + j].zw = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i + 1];
++                    cache_a[wsir * TM + j].xy = buf_a[lds_rd_a + (warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i    ];
++                    cache_a[wsir * TM + j].zw = buf_a[lds_rd_a + (warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i + 1];
                  #else
-@@ -318,7 +347,7 @@ void main() {
+-                    cache_a[wsir * TM + j] = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + i];
++                    cache_a[wsir * TM + j] = buf_a[lds_rd_a + (warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + i];
+                 #endif
+                 }
+             }
  
              [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
                  [[unroll]] for (uint cc = 0; cc < TN; cc++) {
 -                #if defined(DATA_A_F32) || defined(DATA_A_F16)
+-                    cache_b.xy = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i    ];
+-                    cache_b.zw = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i + 1];
 +                #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(PACKED_K)
-                     cache_b.xy = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i    ];
-                     cache_b.zw = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i + 1];
++                    cache_b.xy = buf_b[lds_rd_b + (warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i    ];
++                    cache_b.zw = buf_b[lds_rd_b + (warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i + 1];
                  #else
-@@ -326,6 +355,14 @@ void main() {
+-                    cache_b = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + i];
++                    cache_b = buf_b[lds_rd_b + (warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + i];
                  #endif
  
                      [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
@@ -968,7 +1068,7 @@ index 89346e4..3d9bde9 100644
                          [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
                              // [WNITER][TN][WMITER][TM / 2] -> [wsic][cc][wsir][cr]
                              const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
-@@ -339,6 +376,7 @@ void main() {
+@@ -339,6 +439,7 @@ void main() {
                              sums[sums_idx].y = fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].x), ACC_TYPE(cache_b.x), fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].y), ACC_TYPE(cache_b.y), sums[sums_idx].y));
                          #endif
                          }
@@ -976,8 +1076,13 @@ index 89346e4..3d9bde9 100644
                      }
                  }
              }
-@@ -349,6 +387,15 @@ void main() {
+@@ -346,9 +447,20 @@ void main() {
+         }
+ #endif
+ 
++#if !defined(MM_DBUF)
          barrier();
++#endif
      }
  
 +#if defined(PACKED_K) && !defined(COOPMAT)
@@ -993,10 +1098,137 @@ index 89346e4..3d9bde9 100644
  #ifdef COOPMAT
      [[unroll]] for (uint j = 0; j < cms_per_row * cms_per_col; j++) {
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
-index 00f2f7e..e31d474 100644
+index 00f2f7e..c8fcb1a 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
-@@ -137,8 +137,13 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+@@ -4,26 +4,26 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+             FLOAT_TYPEV8 aa = FLOAT_TYPEV8(data_a[idx]);
+-            buf_a[buf_idx    ] = aa[0].xy;
+-            buf_a[buf_idx + 1] = aa[0].zw;
+-            buf_a[buf_idx + 2] = aa[1].xy;
+-            buf_a[buf_idx + 3] = aa[1].zw;
++            buf_a[lds_off_a + buf_idx    ] = aa[0].xy;
++            buf_a[lds_off_a + buf_idx + 1] = aa[0].zw;
++            buf_a[lds_off_a + buf_idx + 2] = aa[1].xy;
++            buf_a[lds_off_a + buf_idx + 3] = aa[1].zw;
+ #elif LOAD_VEC_A == 4
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+             FLOAT_TYPEV4 aa = FLOAT_TYPEV4(data_a[idx]);
+-            buf_a[buf_idx    ] = aa.xy;
+-            buf_a[buf_idx + 1] = aa.zw;
++            buf_a[lds_off_a + buf_idx    ] = aa.xy;
++            buf_a[lds_off_a + buf_idx + 1] = aa.zw;
+ #else // LOAD_VEC_BATCH_A == 2
+             const uint idx = pos_a + col * p.stride_a + row * 2;
+             const uint buf_idx = col * SHMEM_STRIDE + row;
+             if (idx_m < p.M && block + row * 2 + 1 < end_k) {
+-                buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx],
++                buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(data_a[idx],
+                                               data_a[idx + 1]);
+             } else if (idx_m < p.M && block + row * 2 < end_k) {
+-                buf_a[buf_idx] = FLOAT_TYPEV2(data_a[idx], 0.0f);
++                buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(data_a[idx], 0.0f);
+             } else {
+-                buf_a[buf_idx] = FLOAT_TYPEV2(0.0f);
++                buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(0.0f);
+             }
+ #endif
+ #elif defined(DATA_A_BF16)
+@@ -31,18 +31,18 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+             FLOAT_TYPEV4 aa = FLOAT_TYPEV4(TO_FLOAT_TYPE(data_a[idx]));
+-            buf_a[buf_idx    ] = aa.xy;
+-            buf_a[buf_idx + 1] = aa.zw;
++            buf_a[lds_off_a + buf_idx    ] = aa.xy;
++            buf_a[lds_off_a + buf_idx + 1] = aa.zw;
+ #else // LOAD_VEC_BATCH_A == 2
+             const uint idx = pos_a + col * p.stride_a + row * 2;
+             const uint buf_idx = col * SHMEM_STRIDE + row;
+             if (idx_m < p.M && block + row * 2 + 1 < end_k) {
+-                buf_a[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_a[idx]),
++                buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_a[idx]),
+                                               TO_FLOAT_TYPE(data_a[idx + 1]));
+             } else if (idx_m < p.M && block + row * 2 < end_k) {
+-                buf_a[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_a[idx]), 0.0f);
++                buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_a[idx]), 0.0f);
+             } else {
+-                buf_a[buf_idx] = FLOAT_TYPEV2(0.0f);
++                buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(0.0f);
+             }
+ #endif
+ #elif defined(DATA_A_Q4_0)
+@@ -57,10 +57,10 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const vec4 v0 = (vec4(unpack8(vui & 0x0F0F0F0F)) - 8.0f) * d;
+             const vec4 v1 = (vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(v0.xy);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(v0.zw);
+-            buf_a[buf_idx + 8] = FLOAT_TYPEV2(v1.xy);
+-            buf_a[buf_idx + 9] = FLOAT_TYPEV2(v1.zw);
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(v0.xy);
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(v0.zw);
++            buf_a[lds_off_a + buf_idx + 8] = FLOAT_TYPEV2(v1.xy);
++            buf_a[lds_off_a + buf_idx + 9] = FLOAT_TYPEV2(v1.zw);
+ #elif defined(DATA_A_Q4_1)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+@@ -73,10 +73,10 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const vec4 v0 = vec4(unpack8(vui & 0x0F0F0F0F)) * dm.x + dm.y;
+             const vec4 v1 = vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) * dm.x + dm.y;
+ 
+-            buf_a[buf_idx     ] = FLOAT_TYPEV2(v0.xy);
+-            buf_a[buf_idx + 1 ] = FLOAT_TYPEV2(v0.zw);
+-            buf_a[buf_idx + 8 ] = FLOAT_TYPEV2(v1.xy);
+-            buf_a[buf_idx + 9 ] = FLOAT_TYPEV2(v1.zw);
++            buf_a[lds_off_a + buf_idx     ] = FLOAT_TYPEV2(v0.xy);
++            buf_a[lds_off_a + buf_idx + 1 ] = FLOAT_TYPEV2(v0.zw);
++            buf_a[lds_off_a + buf_idx + 8 ] = FLOAT_TYPEV2(v1.xy);
++            buf_a[lds_off_a + buf_idx + 9 ] = FLOAT_TYPEV2(v1.zw);
+ #elif defined(DATA_A_Q5_0)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+@@ -92,8 +92,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint vui = uint(data_a_packed16[ib].qs[iqs]);
+             const vec4 v = (vec4((vui & 0xF) | qh0.x, ((vui >> 4) & 0xF) | qh0.y, ((vui >> 8) & 0xF) | qh1.x, (vui >> 12) | qh1.y) - 16.0f) * d;
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xz);
+-            buf_a[buf_idx + 8] = FLOAT_TYPEV2(v.yw);
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(v.xz);
++            buf_a[lds_off_a + buf_idx + 8] = FLOAT_TYPEV2(v.yw);
+ #elif defined(DATA_A_Q5_1)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+@@ -112,10 +112,10 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const vec4 v0 = vec4((vui & 0xF) | qh0.x, ((vui >> 4) & 0xF) | qh0.y, ((vui >> 8) & 0xF) | qh1.x, ((vui >> 12) & 0xF) | qh1.y) * dm.x + dm.y;
+             const vec4 v1 = vec4(((vui >> 16) & 0xF) | qh2.x, ((vui >> 20) & 0xF) | qh2.y, ((vui >> 24) & 0xF) | qh3.x, ((vui >> 28) & 0xF) | qh3.y) * dm.x + dm.y;
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(v0.xz);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(v1.xz);
+-            buf_a[buf_idx + 8] = FLOAT_TYPEV2(v0.yw);
+-            buf_a[buf_idx + 9] = FLOAT_TYPEV2(v1.yw);
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(v0.xz);
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(v1.xz);
++            buf_a[lds_off_a + buf_idx + 8] = FLOAT_TYPEV2(v0.yw);
++            buf_a[lds_off_a + buf_idx + 9] = FLOAT_TYPEV2(v1.yw);
+ #elif defined(DATA_A_Q8_0)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+@@ -128,8 +128,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const i8vec2 v1 = unpack8(int32_t(data_a_packed16[ib].qs[2*iqs + 1])).xy;
+             const vec4 v = vec4(v0.x, v0.y, v1.x, v1.y) * d;
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(v.xy);
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(v.zw);
+ #elif defined(DATA_A_Q1_0)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+@@ -137,13 +137,18 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
              const uint ib = idx / 16;
              const uint iqs = idx & 0xfu;
  
@@ -1008,8 +1240,306 @@ index 00f2f7e..e31d474 100644
              const uint bits = uint(data_a[ib].qs[iqs]);
 +#endif
  
-             buf_a[buf_idx    ] = FLOAT_TYPEV2((bits & 0x01u) != 0u ? d : -d, (bits & 0x02u) != 0u ? d : -d);
-             buf_a[buf_idx + 1] = FLOAT_TYPEV2((bits & 0x04u) != 0u ? d : -d, (bits & 0x08u) != 0u ? d : -d);
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2((bits & 0x01u) != 0u ? d : -d, (bits & 0x02u) != 0u ? d : -d);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2((bits & 0x04u) != 0u ? d : -d, (bits & 0x08u) != 0u ? d : -d);
+-            buf_a[buf_idx + 2] = FLOAT_TYPEV2((bits & 0x10u) != 0u ? d : -d, (bits & 0x20u) != 0u ? d : -d);
+-            buf_a[buf_idx + 3] = FLOAT_TYPEV2((bits & 0x40u) != 0u ? d : -d, (bits & 0x80u) != 0u ? d : -d);
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2((bits & 0x01u) != 0u ? d : -d, (bits & 0x02u) != 0u ? d : -d);
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2((bits & 0x04u) != 0u ? d : -d, (bits & 0x08u) != 0u ? d : -d);
++            buf_a[lds_off_a + buf_idx + 2] = FLOAT_TYPEV2((bits & 0x10u) != 0u ? d : -d, (bits & 0x20u) != 0u ? d : -d);
++            buf_a[lds_off_a + buf_idx + 3] = FLOAT_TYPEV2((bits & 0x40u) != 0u ? d : -d, (bits & 0x80u) != 0u ? d : -d);
+ #elif defined(DATA_A_Q2_0)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+@@ -154,10 +159,10 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const float d = float(data_a[ib].d);
+             const uint byte_val = uint(data_a[ib].qs[iqs]);
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(
+                 float(int( byte_val        & 3u) - 1) * d,
+                 float(int((byte_val >> 2u) & 3u) - 1) * d);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(
+                 float(int((byte_val >> 4u) & 3u) - 1) * d,
+                 float(int((byte_val >> 6u) & 3u) - 1) * d);
+ #elif defined(DATA_A_Q2_K)
+@@ -177,8 +182,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+ 
+             const vec4 v = dm.x * float(scales & 0xF) * qs - dm.y * float(scales >> 4);
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(v.xy);
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(v.zw);
+ #elif defined(DATA_A_Q3_K)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+@@ -201,7 +206,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const vec2 qs = vec2(unpack8((uint(data_a_packed16[ib].qs[qsi / 2]) >> qsshift) & 0x0303).xy);
+             const vec2 hm = vec2(unpack8(((uint(data_a_packed16[ib].hmask[hmi / 2]) >> (4 * n + halfsplit)) & 0x0101 ^ 0x0101) << 2).xy);
+ 
+-            buf_a[buf_idx] = FLOAT_TYPEV2(dl * (qs.x - hm.x),
++            buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(dl * (qs.x - hm.x),
+                                           dl * (qs.y - hm.y));
+ #elif defined(DATA_A_Q4_K)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -237,8 +242,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+ 
+             const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m));
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m));
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m));
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m));
+ #elif defined(DATA_A_Q5_K)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+@@ -276,8 +281,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;
+             const vec4 q = vec4(unpack8(qs | qh));
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m));
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m));
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m));
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m));
+ #elif defined(DATA_A_Q6_K)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+@@ -299,7 +304,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint qh = (uint(data_a_packed16[ib].qh[qhi]) >> qhshift) & 0x0303;
+             const vec2 q = (vec2(unpack8(ql | (qh << 4)).xy) - 32) * dscale;
+ 
+-            buf_a[buf_idx] = FLOAT_TYPEV2(q.x, q.y);
++            buf_a[lds_off_a + buf_idx] = FLOAT_TYPEV2(q.x, q.y);
+ #elif defined(DATA_A_IQ1_S)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+@@ -316,7 +321,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const int16_t grid = int16_t(iq1s_grid[qs | (bitfieldExtract(qh, 3 * int(ib8 & 3), 3) << 8)]);
+ 
+             [[unroll]] for (int k = 0; k < 4; ++k) {
+-                buf_a[buf_idx + k] = FLOAT_TYPEV2(dl * (bitfieldExtract(grid, 4 * k    , 2) + delta),
++                buf_a[lds_off_a + buf_idx + k] = FLOAT_TYPEV2(dl * (bitfieldExtract(grid, 4 * k    , 2) + delta),
+                                                   dl * (bitfieldExtract(grid, 4 * k + 2, 2) + delta));
+             }
+ #elif defined(DATA_A_IQ1_M)
+@@ -338,7 +343,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const int16_t grid = int16_t(iq1s_grid[qs | ((qh & 7) << 8)]);
+ 
+             [[unroll]] for (int k = 0; k < 4; ++k) {
+-                buf_a[buf_idx + k] = FLOAT_TYPEV2(dl * (bitfieldExtract(grid, 4 * k    , 2) + delta),
++                buf_a[lds_off_a + buf_idx + k] = FLOAT_TYPEV2(dl * (bitfieldExtract(grid, 4 * k    , 2) + delta),
+                                                   dl * (bitfieldExtract(grid, 4 * k + 2, 2) + delta));
+             }
+ #elif defined(DATA_A_IQ2_XXS)
+@@ -364,13 +369,13 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const vec4 grid0 = vec4(unpack8(grid.x));
+             const vec4 grid1 = vec4(unpack8(grid.y));
+ 
+-            buf_a[buf_idx    ] = db * FLOAT_TYPEV2((sign &   1) != 0 ? -grid0.x : grid0.x,
++            buf_a[lds_off_a + buf_idx    ] = db * FLOAT_TYPEV2((sign &   1) != 0 ? -grid0.x : grid0.x,
+                                                    (sign &   2) != 0 ? -grid0.y : grid0.y);
+-            buf_a[buf_idx + 1] = db * FLOAT_TYPEV2((sign &   4) != 0 ? -grid0.z : grid0.z,
++            buf_a[lds_off_a + buf_idx + 1] = db * FLOAT_TYPEV2((sign &   4) != 0 ? -grid0.z : grid0.z,
+                                                    (sign &   8) != 0 ? -grid0.w : grid0.w);
+-            buf_a[buf_idx + 2] = db * FLOAT_TYPEV2((sign &  16) != 0 ? -grid1.x : grid1.x,
++            buf_a[lds_off_a + buf_idx + 2] = db * FLOAT_TYPEV2((sign &  16) != 0 ? -grid1.x : grid1.x,
+                                                    (sign &  32) != 0 ? -grid1.y : grid1.y);
+-            buf_a[buf_idx + 3] = db * FLOAT_TYPEV2((sign &  64) != 0 ? -grid1.z : grid1.z,
++            buf_a[lds_off_a + buf_idx + 3] = db * FLOAT_TYPEV2((sign &  64) != 0 ? -grid1.z : grid1.z,
+                                                    (sign & 128) != 0 ? -grid1.w : grid1.w);
+ #elif defined(DATA_A_IQ2_XS)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -390,13 +395,13 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const vec4 grid0 = vec4(unpack8(grid.x));
+             const vec4 grid1 = vec4(unpack8(grid.y));
+ 
+-            buf_a[buf_idx    ] = db * FLOAT_TYPEV2((sign &   1) != 0 ? -grid0.x : grid0.x,
++            buf_a[lds_off_a + buf_idx    ] = db * FLOAT_TYPEV2((sign &   1) != 0 ? -grid0.x : grid0.x,
+                                                    (sign &   2) != 0 ? -grid0.y : grid0.y);
+-            buf_a[buf_idx + 1] = db * FLOAT_TYPEV2((sign &   4) != 0 ? -grid0.z : grid0.z,
++            buf_a[lds_off_a + buf_idx + 1] = db * FLOAT_TYPEV2((sign &   4) != 0 ? -grid0.z : grid0.z,
+                                                    (sign &   8) != 0 ? -grid0.w : grid0.w);
+-            buf_a[buf_idx + 2] = db * FLOAT_TYPEV2((sign &  16) != 0 ? -grid1.x : grid1.x,
++            buf_a[lds_off_a + buf_idx + 2] = db * FLOAT_TYPEV2((sign &  16) != 0 ? -grid1.x : grid1.x,
+                                                    (sign &  32) != 0 ? -grid1.y : grid1.y);
+-            buf_a[buf_idx + 3] = db * FLOAT_TYPEV2((sign &  64) != 0 ? -grid1.z : grid1.z,
++            buf_a[lds_off_a + buf_idx + 3] = db * FLOAT_TYPEV2((sign &  64) != 0 ? -grid1.z : grid1.z,
+                                                    (sign & 128) != 0 ? -grid1.w : grid1.w);
+ #elif defined(DATA_A_IQ2_S)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -418,13 +423,13 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const vec4 grid0 = vec4(unpack8(grid.x));
+             const vec4 grid1 = vec4(unpack8(grid.y));
+ 
+-            buf_a[buf_idx    ] = db * FLOAT_TYPEV2((sign &   1) != 0 ? -grid0.x : grid0.x,
++            buf_a[lds_off_a + buf_idx    ] = db * FLOAT_TYPEV2((sign &   1) != 0 ? -grid0.x : grid0.x,
+                                                    (sign &   2) != 0 ? -grid0.y : grid0.y);
+-            buf_a[buf_idx + 1] = db * FLOAT_TYPEV2((sign &   4) != 0 ? -grid0.z : grid0.z,
++            buf_a[lds_off_a + buf_idx + 1] = db * FLOAT_TYPEV2((sign &   4) != 0 ? -grid0.z : grid0.z,
+                                                    (sign &   8) != 0 ? -grid0.w : grid0.w);
+-            buf_a[buf_idx + 2] = db * FLOAT_TYPEV2((sign &  16) != 0 ? -grid1.x : grid1.x,
++            buf_a[lds_off_a + buf_idx + 2] = db * FLOAT_TYPEV2((sign &  16) != 0 ? -grid1.x : grid1.x,
+                                                    (sign &  32) != 0 ? -grid1.y : grid1.y);
+-            buf_a[buf_idx + 3] = db * FLOAT_TYPEV2((sign &  64) != 0 ? -grid1.z : grid1.z,
++            buf_a[lds_off_a + buf_idx + 3] = db * FLOAT_TYPEV2((sign &  64) != 0 ? -grid1.z : grid1.z,
+                                                    (sign & 128) != 0 ? -grid1.w : grid1.w);
+ #elif defined(DATA_A_IQ3_XXS)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -446,9 +451,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint grid = iq3xxs_grid[qs];
+             const vec4 v = db * vec4(unpack8(grid));
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2((sign &   1) != 0 ? -v.x : v.x,
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2((sign &   1) != 0 ? -v.x : v.x,
+                                               (sign &   2) != 0 ? -v.y : v.y);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2((sign &   4) != 0 ? -v.z : v.z,
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2((sign &   4) != 0 ? -v.z : v.z,
+                                               (sign &   8) != 0 ? -v.w : v.w);
+ #elif defined(DATA_A_IQ3_S)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -468,9 +473,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint32_t grid = iq3s_grid[qs | ((qh << (8 - (iqs % 8))) & 256)];
+             const vec4 v = db * vec4(unpack8(grid));
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2((sign &   1) != 0 ? -v.x : v.x,
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2((sign &   1) != 0 ? -v.x : v.x,
+                                               (sign &   2) != 0 ? -v.y : v.y);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2((sign &   4) != 0 ? -v.z : v.z,
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2((sign &   4) != 0 ? -v.z : v.z,
+                                               (sign &   8) != 0 ? -v.w : v.w);
+ #elif defined(DATA_A_IQ4_XS)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -488,8 +493,8 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const float d = float(data_a[ib].d);
+             const vec4 v = d * float(int(sl | (sh << 4)) - 32) * vec4(kvalues_iq4nl[qs.x], kvalues_iq4nl[qs.y], kvalues_iq4nl[qs.z], kvalues_iq4nl[qs.w]);
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
+-            buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(v.xy);
++            buf_a[lds_off_a + buf_idx + 1] = FLOAT_TYPEV2(v.zw);
+ #elif defined(DATA_A_IQ4_NL)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
+@@ -500,9 +505,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const FLOAT_TYPE d = FLOAT_TYPE(data_a_packed16[ib].d);
+             const uint vui = uint(data_a_packed16[ib].qs[iqs]);
+ 
+-            buf_a[buf_idx    ] = d * FLOAT_TYPEV2(kvalues_iq4nl[vui & 0xF],
++            buf_a[lds_off_a + buf_idx    ] = d * FLOAT_TYPEV2(kvalues_iq4nl[vui & 0xF],
+                                                   kvalues_iq4nl[bitfieldExtract(vui, 8, 4)]);
+-            buf_a[buf_idx + 8] = d * FLOAT_TYPEV2(kvalues_iq4nl[bitfieldExtract(vui, 4, 4)],
++            buf_a[lds_off_a + buf_idx + 8] = d * FLOAT_TYPEV2(kvalues_iq4nl[bitfieldExtract(vui, 4, 4)],
+                                                   kvalues_iq4nl[vui >> 12]);
+ #elif defined(DATA_A_MXFP4)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -515,9 +520,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint vui = uint(data_a[ib].qs[iqs]);
+             const uint vui2 = uint(data_a[ib].qs[iqs+1]);
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
+                                               kvalues_mxfp4[vui2 & 0xF] * d);
+-            buf_a[buf_idx + 8] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
++            buf_a[lds_off_a + buf_idx + 8] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
+                                               kvalues_mxfp4[vui2 >>  4] * d);
+ #elif defined(DATA_A_NVFP4)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+@@ -532,9 +537,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint vui = uint(data_a[ib].qs[iqs]);
+             const uint vui2 = uint(data_a[ib].qs[iqs+1]);
+ 
+-            buf_a[buf_idx    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
++            buf_a[lds_off_a + buf_idx    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
+                                               kvalues_mxfp4[vui2 & 0xF] * d);
+-            buf_a[buf_idx + 4] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
++            buf_a[lds_off_a + buf_idx + 4] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
+                                               kvalues_mxfp4[vui2 >>  4] * d);
+ #endif
+ }
+@@ -546,10 +551,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
+             const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
+             FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
+-            buf_b[buf_idx + 0] = bb[0].xy;
+-            buf_b[buf_idx + 1] = bb[0].zw;
+-            buf_b[buf_idx + 2] = bb[1].xy;
+-            buf_b[buf_idx + 3] = bb[1].zw;
++            buf_b[lds_off_b + buf_idx + 0] = bb[0].xy;
++            buf_b[lds_off_b + buf_idx + 1] = bb[0].zw;
++            buf_b[lds_off_b + buf_idx + 2] = bb[1].xy;
++            buf_b[lds_off_b + buf_idx + 3] = bb[1].zw;
+ #elif LOAD_VEC_B == 4
+             const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
+@@ -558,18 +563,18 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
+ #else
+             FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
+ #endif
+-            buf_b[buf_idx + 0] = bb.xy;
+-            buf_b[buf_idx + 1] = bb.zw;
++            buf_b[lds_off_b + buf_idx + 0] = bb.xy;
++            buf_b[lds_off_b + buf_idx + 1] = bb.zw;
+ #else // LOAD_VEC_BATCH_B == 2
+             const uint idx = pos_b + col * p.stride_b + row * 2;
+             const uint buf_idx = col * SHMEM_STRIDE + row;
+             if (idx_n < p.N && block + row * 2 + 1 < end_k) {
+-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]),
++                buf_b[lds_off_b + buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]),
+                                               TO_FLOAT_TYPE(data_b[idx + 1]));
+             } else if (idx_n < p.N && block + row * 2 < end_k) {
+-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]), 0.0f);
++                buf_b[lds_off_b + buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]), 0.0f);
+             } else {
+-                buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
++                buf_b[lds_off_b + buf_idx] = FLOAT_TYPEV2(0.0f);
+             }
+ #endif
+ }
+@@ -581,10 +586,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
+             const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
+             FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
+-            buf_b[buf_idx + 0] = bb[0].xy;
+-            buf_b[buf_idx + 1] = bb[0].zw;
+-            buf_b[buf_idx + 2] = bb[1].xy;
+-            buf_b[buf_idx + 3] = bb[1].zw;
++            buf_b[lds_off_b + buf_idx + 0] = bb[0].xy;
++            buf_b[lds_off_b + buf_idx + 1] = bb[0].zw;
++            buf_b[lds_off_b + buf_idx + 2] = bb[1].xy;
++            buf_b[lds_off_b + buf_idx + 3] = bb[1].zw;
+ #elif LOAD_VEC_B == 4
+             const u16vec2 row_idx = row_ids[col];
+             const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
+@@ -594,22 +599,22 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
+ #else
+             FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
+ #endif
+-            buf_b[buf_idx + 0] = bb.xy;
+-            buf_b[buf_idx + 1] = bb.zw;
++            buf_b[lds_off_b + buf_idx + 0] = bb.xy;
++            buf_b[lds_off_b + buf_idx + 1] = bb.zw;
+ #else // LOAD_VEC_BATCH_B == 2
+             const uint row_i = ic * BN + col;
+             const uint buf_idx = col * SHMEM_STRIDE + row;
+             if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
+                 const u16vec2 row_idx = row_ids[col];
+                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
+-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]),
++                buf_b[lds_off_b + buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]),
+                                               TO_FLOAT_TYPE(data_b[idx + 1]));
+             } else if (row_i < _ne1 && block + row * 2 < end_k) {
+                 const u16vec2 row_idx = row_ids[col];
+                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
+-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]), 0.0f);
++                buf_b[lds_off_b + buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]), 0.0f);
+             } else {
+-                buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
++                buf_b[lds_off_b + buf_idx] = FLOAT_TYPEV2(0.0f);
+             }
+ #endif
+ }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/sigglu.comp b/ggml/src/ggml-vulkan/vulkan-shaders/sigglu.comp
 new file mode 100644
 index 0000000..659bbf7
@@ -1100,10 +1630,10 @@ index f31d79a..b6dc42d 100644
  
  
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index fc0dd01..e80ef07 100644
+index fc0dd01..34888b9 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -582,6 +582,27 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+@@ -582,6 +582,32 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
          if (!coopmat2) {
              string_to_spv(shader_name + "_" + tname + "_f32",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
              string_to_spv(shader_name + "_" + tname + "_f32_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
@@ -1126,12 +1656,17 @@ index fc0dd01..e80ef07 100644
 +                if (fp16 && f16acc) {
 +                    string_to_spv(shader_name + "_" + tname + "_f32_pk_soa",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"TERNARY_SOA", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
 +                    string_to_spv(shader_name + "_" + tname + "_f32_pk_soa_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"TERNARY_SOA", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
++                    // double-buffered LDS variants (GGML_VK_MM_DBUF=1)
++                    string_to_spv(shader_name + "_" + tname + "_f32_pk_db",             source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"MM_DBUF", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
++                    string_to_spv(shader_name + "_" + tname + "_f32_pk_db_aligned",     source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"MM_DBUF", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
++                    string_to_spv(shader_name + "_" + tname + "_f32_pk_soa_db",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"TERNARY_SOA", "1"}, {"MM_DBUF", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
++                    string_to_spv(shader_name + "_" + tname + "_f32_pk_soa_db_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"TERNARY_SOA", "1"}, {"MM_DBUF", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
 +                }
 +            }
          }
  
          if (tname != "f16" && tname != "f32") {
-@@ -701,6 +722,57 @@ void process_shaders() {
+@@ -701,6 +727,57 @@ void process_shaders() {
          string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
          string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
  
@@ -1189,7 +1724,7 @@ index fc0dd01..e80ef07 100644
          string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
          string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
          string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
-@@ -911,6 +983,8 @@ void process_shaders() {
+@@ -911,6 +988,8 @@ void process_shaders() {
      string_to_spv("reglu_f32",      "reglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
      string_to_spv("swiglu_f16",     "swiglu.comp",      {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
      string_to_spv("swiglu_f32",     "swiglu.comp",      {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
@@ -1198,7 +1733,7 @@ index fc0dd01..e80ef07 100644
      string_to_spv("swiglu_oai_f16", "swiglu_oai.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
      string_to_spv("swiglu_oai_f32", "swiglu_oai.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
      string_to_spv("geglu_erf_f16",  "geglu_erf.comp",   {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
-@@ -1156,6 +1230,30 @@ void write_output_files() {
+@@ -1156,6 +1235,30 @@ void write_output_files() {
              src << "const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3] = {mul_mat_vec_" << tname << "_" << btype << "_f32_data, mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_data, mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_no_shmem_data};\n";
              src << "const uint64_t arr_dmmv_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
          }
