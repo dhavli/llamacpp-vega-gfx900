@@ -1,30 +1,165 @@
-From 904c8663c2c355f75d5f7461c774f678e94cac09 Mon Sep 17 00:00:00 2001
+From cb8d762cdfc7628713a3e1df2044f7d5852ebddd Mon Sep 17 00:00:00 2001
 From: Donach's Bot <bot@braiins.cz>
 Date: Thu, 30 Jul 2026 19:09:57 +0200
 Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
  tuning knobs
 
-- Q1_0/Q2_0 get packed16 struct views (2-byte aligned loads; 18/34-byte
-  blocks preclude packed32)
-- dedicated TERNARY_WIDE mul_mat_vec variant for single-column dispatches:
-  32 weights/thread/iter, activations staged in registers, dot computed as
-  fma(code, b) with one correction term (no dequantized weights)
-- generic path retained for batched (NUM_COLS>1) matvec: wide variant's
-  register pressure regresses n=2..8
-- GGML_VK_TERNARY_ROWS: rows/workgroup for the n==1 ternary pipelines
-- GGML_VK_GCN_SUBGROUP_REDUCE: opt GCN into subgroup reductions
+- TERNARY_WIDE: dedicated n==1 matvec for Q1_0/Q2_0, 32 weights/thread/iter
+  via packed16 loads, activations staged in registers across rows.
+- TERNARY_F16 (GGML_VK_TERNARY_F16=1): fp16 staging + packed f16
+  accumulation (v_pk_fma_f16) in the wide path; halves staged VGPRs and fma
+  count. Block-scale correction stays fp32.
+- PACKED_K (GGML_VK_MM_PACKED=1): mul_mm f16acc variants for Q1_0/Q2_0
+  accumulate even/odd k in the two lanes of one f16vec2 per output -> one
+  v_pk_fma_f16 per k-pair instead of two scalar v_fma_f16 (GCN runs scalar
+  f16 fma at fp32 rate).
+- GGML_VK_TERNARY_ROWS: rows/workgroup knob for the wide path (1..16).
+- GGML_VK_GCN_SUBGROUP_REDUCE=1: opt GCN into subgroup reductions.
+- GGML_VK_TILE_{L,M,S}: runtime warptile override (11 csv uints) for the
+  dequant mmq pipelines, wg_denoms follow BM/BN.
 ---
- ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 27 +++++--
- .../vulkan-shaders/mul_mat_vec.comp           | 80 ++++++++++++++++++-
- .../src/ggml-vulkan/vulkan-shaders/types.glsl | 18 +++++
- .../vulkan-shaders/vulkan-shaders-gen.cpp     | 20 +++++
- 4 files changed, 136 insertions(+), 9 deletions(-)
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 215 ++++++++++++++++--
+ .../vulkan-shaders/dequant_funcs.glsl         |  32 +++
+ .../vulkan-shaders/mul_mat_vec.comp           | 181 ++++++++++++++-
+ .../vulkan-shaders/mul_mat_vec_iface.glsl     |   7 +
+ .../ggml-vulkan/vulkan-shaders/mul_mm.comp    |  44 +++-
+ .../vulkan-shaders/mul_mm_funcs.glsl          |   5 +
+ .../src/ggml-vulkan/vulkan-shaders/types.glsl |  18 ++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  96 ++++++++
+ 8 files changed, 582 insertions(+), 16 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index fd22aba..4c03914 100644
+index fd22aba..f259aad 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -4567,8 +4567,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -751,6 +751,9 @@ struct vk_device_struct {
+     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
++    // SoA-repacked Q1_0 (GGML_VK_TERNARY_SOA): [0]=f32 B, [1]=f16 B
++    vk_pipeline pipeline_dmmv_q1_0_soa[2][DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
++    vk_matmul_pipeline2 pipeline_mul_mat_soa_q1_0;
+     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+ 
+     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+@@ -3585,6 +3588,47 @@ struct CompileTask {
+     uint32_t required_subgroup_size;
+ };
+ 
++// GGML_VK_TERNARY_SOA=1: Q1_0 mul_mat weight tensors are repacked at upload
++// into groups of 64 blocks laid out [64 x f16 d][64 x 16B qs] so the matvec
++// reads one lane-coalesced dword per 32 weights instead of three scattered
++// sub-dword loads. token_embd.weight is excluded (read by GET_ROWS, and by the
++// tied lm_head).
++static bool ggml_vk_ternary_soa_enabled() {
++    static const bool en = getenv("GGML_VK_TERNARY_SOA") != nullptr;
++    return en;
++}
++
++static bool ggml_vk_tensor_is_q1_0_soa(const ggml_tensor * t) {
++    if (!ggml_vk_ternary_soa_enabled() || t == nullptr || t->type != GGML_TYPE_Q1_0) {
++        return false;
++    }
++    if (t->ne[2] != 1 || t->ne[3] != 1 || !ggml_is_contiguous(t)) {
++        return false;
++    }
++    const int64_t nblocks = ggml_nelements(t) / 128;
++    if (nblocks % 64 != 0) {
++        return false;
++    }
++    if (strcmp(t->name, "token_embd.weight") == 0) {
++        return false;
++    }
++    return true;
++}
++
++// AoS block_q1_0 (18 B: f16 d + 16 B qs) -> SoA groups of 64 blocks.
++static void ggml_vk_repack_q1_0_soa(const void * src, void * dst, size_t nblocks) {
++    const uint8_t * sp = (const uint8_t *) src;
++    uint8_t * dp = (uint8_t *) dst;
++    for (size_t g = 0; g < nblocks / 64; ++g) {
++        const uint8_t * sb = sp + g * 64 * 18;
++        uint8_t * db = dp + g * 1152;
++        for (int l = 0; l < 64; ++l) {
++            memcpy(db + 2 * l, sb + 18 * l, 2);
++            memcpy(db + 128 + 16 * l, sb + 18 * l + 2, 16);
++        }
++    }
++}
++
+ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+ 
+@@ -3732,6 +3776,36 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         m_align =  64;
+         s_align =  32;
+ 
++        // Runtime warptile override for tuning the quantized (dequant) mul_mm
++        // pipelines: GGML_VK_TILE_{L,M,S} = 11 comma-separated uints
++        // {wg_threads,BM,BN,BK,WM,WN,WMITER,TM,TN,TK,warp}. wg_denoms follow
++        // BM/BN. The shmem-support checks below validate the result.
++        const auto tile_env = [](const char * name, std::vector<uint32_t> & wt, std::array<uint32_t, 3> & denoms) {
++            const char * s = getenv(name);
++            if (s == nullptr) {
++                return;
++            }
++            std::vector<uint32_t> v;
++            const char * q = s;
++            while (*q) {
++                char * end;
++                unsigned long val = strtoul(q, &end, 10);
++                if (end == q) break;
++                v.push_back((uint32_t)val);
++                q = (*end == ',') ? end + 1 : end;
++            }
++            if (v.size() == 11) {
++                wt = v;
++                denoms = { v[1], v[2], 1 };
++                std::cerr << "ggml_vulkan: " << name << " warptile override {" << v[0] << "," << v[1] << "," << v[2] << "," << v[3] << "," << v[4] << "," << v[5] << "," << v[6] << "," << v[7] << "," << v[8] << "," << v[9] << "," << v[10] << "}" << std::endl;
++            } else {
++                std::cerr << "ggml_vulkan: ignoring " << name << " (need 11 comma-separated values, got " << v.size() << ")" << std::endl;
++            }
++        };
++        tile_env("GGML_VK_TILE_L", l_warptile_mmq, l_mmq_wg_denoms);
++        tile_env("GGML_VK_TILE_M", m_warptile_mmq, m_mmq_wg_denoms);
++        tile_env("GGML_VK_TILE_S", s_warptile_mmq, s_mmq_wg_denoms);
++
+         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
+             ggml_type t = (ggml_type)i;
+             // Disable medium and large matrix multiplication if not enough shared memory is available
+@@ -4253,8 +4327,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+         CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+ 
+-        CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+-        CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        // GGML_VK_MM_PACKED=1 swaps the f16acc mul_mm pipelines for the
++        // binary/ternary quants to the packed-k shaders (PACKED_K in
++        // mul_mm.comp): one v_pk_fma_f16 per k-pair instead of two scalar
++        // f16 fmas, which GCN executes at fp32 rate.
++        if (getenv("GGML_VK_MM_PACKED") != nullptr) {
++            CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f16acc, matmul_q1_0_f32_pk, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f32acc, matmul_q1_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f16acc, matmul_q2_0_f32_pk, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0].f32acc, matmul_q2_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        } else {
++            CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_0], matmul_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        }
++
++        // SoA-repacked Q1_0 mul_mm pipelines (GGML_VK_TERNARY_SOA=1).
++        if (ggml_vk_ternary_soa_enabled()) {
++            if (getenv("GGML_VK_MM_PACKED") != nullptr) {
++                CREATE_MM(GGML_TYPE_Q1_0, pipeline_mul_mat_soa_q1_0.f16acc, matmul_q1_0_f32_pk_soa, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            } else {
++                CREATE_MM(GGML_TYPE_Q1_0, pipeline_mul_mat_soa_q1_0.f16acc, matmul_q1_0_f32_soa, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++            }
++            CREATE_MM(GGML_TYPE_Q1_0, pipeline_mul_mat_soa_q1_0.f32acc, matmul_q1_0_f32_soa, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        }
+         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0], matmul_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+@@ -4567,8 +4662,35 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          rm_stdq_int = 2;
      }
      uint32_t rm_iq = 2 * rm_kq;
@@ -37,6 +172,22 @@ index fd22aba..4c03914 100644
 +        rm_ter = std::max(1, std::min(16, atoi(s)));
 +    }
 +
++    // GGML_VK_TERNARY_F16=1 selects the wide16 matvec variants for Q1_0/Q2_0:
++    // fp16 activation staging + packed f16 accumulation (v_pk_fma_f16), which
++    // halves both the staged registers and the fma count on GCN/RDNA.
++    const bool ternary_f16 = getenv("GGML_VK_TERNARY_F16") != nullptr;
++
++    // GGML_VK_TERNARY_DEBUG=nob|noa selects timing-probe matvec variants that
++    // skip the activation (nob) or weight (noa) load stream. WRONG RESULTS —
++    // for bottleneck attribution only.
++    // GGML_VK_TERNARY_LUT=1 (with GGML_VK_TERNARY_SOA=1): the wide SoA matvec
++    // maps sign-bit nibbles to f16vec4(+-1) via a 16-entry LDS table.
++    const bool ternary_lut = getenv("GGML_VK_TERNARY_LUT") != nullptr;
++
++    const char * ternary_dbg = getenv("GGML_VK_TERNARY_DEBUG");
++    const bool ternary_nob = ternary_dbg != nullptr && strcmp(ternary_dbg, "nob") == 0;
++    const bool ternary_noa = ternary_dbg != nullptr && strcmp(ternary_dbg, "noa") == 0;
++
 +    // GCN is excluded from subgroup reductions by default; with only one wave64
 +    // per workgroup the shmem tree reduction (7 barriers) is pure overhead there.
 +    // GGML_VK_GCN_SUBGROUP_REDUCE=1 opts GCN into the subgroup path for A/B testing.
@@ -46,29 +197,35 @@ index fd22aba..4c03914 100644
      // Ensure a subgroup size >= 16 is available
      const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
  
-@@ -4596,8 +4607,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4596,8 +4718,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
 -            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
 -            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", arr_dmmv_q2_0_f32_f32_len[reduc], arr_dmmv_q2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", (i == 0 ? arr_dmmv_q1_0_wide_f32_f32_len : arr_dmmv_q1_0_f32_f32_len)[reduc], (i == 0 ? arr_dmmv_q1_0_wide_f32_f32_data : arr_dmmv_q1_0_f32_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", (i == 0 ? arr_dmmv_q2_0_wide_f32_f32_len : arr_dmmv_q2_0_f32_f32_len)[reduc], (i == 0 ? arr_dmmv_q2_0_wide_f32_f32_data : arr_dmmv_q2_0_f32_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", (i == 0 ? (ternary_nob ? arr_dmmv_q1_0_widenob_f32_f32_len : ternary_noa ? arr_dmmv_q1_0_widenoa_f32_f32_len : ternary_f16 ? arr_dmmv_q1_0_wide16_f32_f32_len : arr_dmmv_q1_0_wide_f32_f32_len) : arr_dmmv_q1_0_f32_f32_len)[reduc], (i == 0 ? (ternary_nob ? arr_dmmv_q1_0_widenob_f32_f32_data : ternary_noa ? arr_dmmv_q1_0_widenoa_f32_f32_data : ternary_f16 ? arr_dmmv_q1_0_wide16_f32_f32_data : arr_dmmv_q1_0_wide_f32_f32_data) : arr_dmmv_q1_0_f32_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            if (ggml_vk_ternary_soa_enabled()) {
++                ggml_vk_create_pipeline(device, device->pipeline_dmmv_q1_0_soa[0][w][i], "mul_mat_vec_q1_0_soa_f32_f32", (i == 0 ? (ternary_lut ? arr_dmmv_q1_0_widelut_f32_f32_len : arr_dmmv_q1_0_widesoa_f32_f32_len) : arr_dmmv_q1_0_soa_f32_f32_len)[reduc], (i == 0 ? (ternary_lut ? arr_dmmv_q1_0_widelut_f32_f32_data : arr_dmmv_q1_0_widesoa_f32_f32_data) : arr_dmmv_q1_0_soa_f32_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            }
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", (i == 0 ? (ternary_f16 ? arr_dmmv_q2_0_wide16_f32_f32_len : arr_dmmv_q2_0_wide_f32_f32_len) : arr_dmmv_q2_0_f32_f32_len)[reduc], (i == 0 ? (ternary_f16 ? arr_dmmv_q2_0_wide16_f32_f32_data : arr_dmmv_q2_0_wide_f32_f32_data) : arr_dmmv_q2_0_f32_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f32_f32", arr_dmmv_q4_0_f32_f32_len[reduc], arr_dmmv_q4_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f32_f32", arr_dmmv_q4_1_f32_f32_len[reduc], arr_dmmv_q4_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f32_f32", arr_dmmv_q5_0_f32_f32_len[reduc], arr_dmmv_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-@@ -4623,8 +4634,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4623,8 +4748,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f16_f32",  arr_dmmv_f32_f16_f32_len[reduc],  arr_dmmv_f32_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
 -            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", arr_dmmv_q1_0_f16_f32_len[reduc], arr_dmmv_q1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
 -            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", arr_dmmv_q2_0_f16_f32_len[reduc], arr_dmmv_q2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", (i == 0 ? arr_dmmv_q1_0_wide_f16_f32_len : arr_dmmv_q1_0_f16_f32_len)[reduc], (i == 0 ? arr_dmmv_q1_0_wide_f16_f32_data : arr_dmmv_q1_0_f16_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", (i == 0 ? arr_dmmv_q2_0_wide_f16_f32_len : arr_dmmv_q2_0_f16_f32_len)[reduc], (i == 0 ? arr_dmmv_q2_0_wide_f16_f32_data : arr_dmmv_q2_0_f16_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", (i == 0 ? (ternary_f16 ? arr_dmmv_q1_0_wide16_f16_f32_len : arr_dmmv_q1_0_wide_f16_f32_len) : arr_dmmv_q1_0_f16_f32_len)[reduc], (i == 0 ? (ternary_f16 ? arr_dmmv_q1_0_wide16_f16_f32_data : arr_dmmv_q1_0_wide_f16_f32_data) : arr_dmmv_q1_0_f16_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            if (ggml_vk_ternary_soa_enabled()) {
++                ggml_vk_create_pipeline(device, device->pipeline_dmmv_q1_0_soa[1][w][i], "mul_mat_vec_q1_0_soa_f16_f32", (i == 0 ? (ternary_lut ? arr_dmmv_q1_0_widelut_f16_f32_len : arr_dmmv_q1_0_widesoa_f16_f32_len) : arr_dmmv_q1_0_soa_f16_f32_len)[reduc], (i == 0 ? (ternary_lut ? arr_dmmv_q1_0_widelut_f16_f32_data : arr_dmmv_q1_0_widesoa_f16_f32_data) : arr_dmmv_q1_0_soa_f16_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            }
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", (i == 0 ? (ternary_f16 ? arr_dmmv_q2_0_wide16_f16_f32_len : arr_dmmv_q2_0_wide_f16_f32_len) : arr_dmmv_q2_0_f16_f32_len)[reduc], (i == 0 ? (ternary_f16 ? arr_dmmv_q2_0_wide16_f16_f32_data : arr_dmmv_q2_0_wide_f16_f32_data) : arr_dmmv_q2_0_f16_f32_data)[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {i == 0 ? rm_ter : 2*rm_stdq, 1, 1}, {wg_size_subgroup, i == 0 ? rm_ter : 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f16_f32", arr_dmmv_q4_0_f16_f32_len[reduc], arr_dmmv_q4_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f16_f32", arr_dmmv_q4_1_f16_f32_len[reduc], arr_dmmv_q4_1_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
              ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f16_f32", arr_dmmv_q5_0_f16_f32_len[reduc], arr_dmmv_q5_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-@@ -4676,8 +4687,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -4676,8 +4804,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_F32 ], "mul_mat_vec_id_f32_f32",        arr_dmmv_id_f32_f32_f32_len[reduc],     arr_dmmv_id_f32_f32_f32_data[reduc],     "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1, 1, 1}, {wg_size_subgroup, 1}, 1, false, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_F16 ], "mul_mat_vec_id_f16_f32",        arr_dmmv_id_f16_f32_f32_len[reduc],     arr_dmmv_id_f16_f32_f32_data[reduc],     "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_BF16], "mul_mat_vec_id_bf16_f32",       arr_dmmv_id_bf16_f32_f32_len[reduc],    arr_dmmv_id_bf16_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
@@ -79,15 +236,221 @@ index fd22aba..4c03914 100644
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_f32",       arr_dmmv_id_q4_0_f32_f32_len[reduc],    arr_dmmv_id_q4_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_1], "mul_mat_vec_id_q4_1_f32",       arr_dmmv_id_q4_1_f32_f32_len[reduc],    arr_dmmv_id_q4_1_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
          ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q5_0], "mul_mat_vec_id_q5_0_f32",       arr_dmmv_id_q5_0_f32_f32_len[reduc],    arr_dmmv_id_q5_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
+@@ -6780,8 +6908,12 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type
+     return ctx->device->pipeline_dequant[type];
+ }
+ 
+-static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
++static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool soa = false) {
+     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
++    if (soa && src0_type == GGML_TYPE_Q1_0 && src1_type == GGML_TYPE_F32) {
++        return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_mul_mat_soa_q1_0.f16acc : ctx->device->pipeline_mul_mat_soa_q1_0.f32acc;
++    }
++
+     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+         return ctx->device->pipeline_matmul_f32;
+     }
+@@ -6861,7 +6993,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
+     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+ }
+ 
+-static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
++static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k, bool soa = false) {
+     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
+     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
+     GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
+@@ -6943,6 +7075,16 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
+     }
+ 
++    if (soa && a_type == GGML_TYPE_Q1_0 && (b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16)) {
++        if (getenv("GGML_VK_SOA_DEBUG") != nullptr) {
++            static int logged = 0;
++            if (logged < 8) {
++                logged++;
++                fprintf(stderr, "SOA dmmv selected: b=%d wg=%d cols=%u\n", b_type == GGML_TYPE_F16 ? 1 : 0, (int)dmmv_wg, num_cols);
++            }
++        }
++        return ctx->device->pipeline_dmmv_q1_0_soa[b_type == GGML_TYPE_F16 ? 1 : 0][dmmv_wg][num_cols-1];
++    }
+     return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
+ }
+ 
+@@ -8243,7 +8385,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+ 
+     if (mmp == nullptr) {
+         // Fall back to f16 dequant mul mat
+-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
++        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0], ggml_vk_tensor_is_q1_0_soa(src0));
+         quantize_y = false;
+     }
+ 
+@@ -8584,7 +8726,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+ 
+     if (dmmv == nullptr) {
+         // Fall back to f16 dequant mul mat
+-        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00);
++        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00, ggml_vk_tensor_is_q1_0_soa(src0));
+         quantize_y = false;
+     }
+ 
+@@ -10859,6 +11001,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+ 
+         } break;
+     case GGML_OP_GET_ROWS:
++        GGML_ASSERT(!ggml_vk_tensor_is_q1_0_soa(src0) && "SoA-repacked tensor read by GET_ROWS");
+         elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
+         elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+@@ -14487,6 +14630,21 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
+         return;
+     }
+ 
++    if (ggml_vk_tensor_is_q1_0_soa(tensor)) {
++        // SoA repack happens at upload; requires whole-tensor writes.
++        GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) && "GGML_VK_TERNARY_SOA needs whole-tensor uploads (use --no-mmap)");
++        std::vector<uint8_t> repacked(size);
++        ggml_vk_repack_q1_0_soa(data, repacked.data(), ggml_nelements(tensor) / 128);
++        if (getenv("GGML_VK_SOA_DEBUG") != nullptr) {
++            fprintf(stderr, "SOA repack %s nblocks=%zu vkoff=%zu mod4=%zu\n",
++                tensor->name, (size_t)(ggml_nelements(tensor) / 128),
++                (size_t)(vk_tensor_offset(tensor) + tensor->view_offs),
++                (size_t)((vk_tensor_offset(tensor) + tensor->view_offs) % 4));
++        }
++        ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs, repacked.data(), size);
++        return;
++    }
++
+     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+ }
+ 
+@@ -14501,6 +14659,7 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
+         return;
+     }
+ 
++    GGML_ASSERT(!ggml_vk_tensor_is_q1_0_soa(tensor) && "GGML_VK_TERNARY_SOA needs whole-tensor uploads (use --no-mmap)");
+     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
+ }
+ 
+@@ -14727,6 +14886,34 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
+         return;
+     }
+ 
++    if (ggml_vk_tensor_is_q1_0_soa(tensor)) {
++        // The streaming loader may deliver the tensor in chunks; the SoA
++        // repack needs the whole tensor. Accumulate into a host shadow and
++        // repack + upload synchronously once every byte has arrived.
++        GGML_ASSERT(n_copies == 1 && stride_tensor == size && stride_data == size);
++        static std::mutex soa_mtx;
++        static std::unordered_map<const ggml_tensor *, std::pair<std::vector<uint8_t>, size_t>> soa_staging;
++        std::lock_guard<std::mutex> lk(soa_mtx);
++        auto & st = soa_staging[tensor];
++        if (st.first.empty()) {
++            st.first.resize(ggml_nbytes(tensor));
++            st.second = 0;
++        }
++        memcpy(st.first.data() + offset, data, size);
++        st.second += size;
++        if (st.second == ggml_nbytes(tensor)) {
++            std::vector<uint8_t> repacked(st.first.size());
++            ggml_vk_repack_q1_0_soa(st.first.data(), repacked.data(), ggml_nelements(tensor) / 128);
++            if (getenv("GGML_VK_SOA_DEBUG") != nullptr) {
++                fprintf(stderr, "SOA repack (async) %s nblocks=%zu\n", tensor->name, (size_t)(ggml_nelements(tensor) / 128));
++            }
++            ggml_backend_vk_buffer_context * sbuf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
++            ggml_vk_buffer_write(sbuf_ctx->dev_buffer, vk_tensor_offset(tensor) + tensor->view_offs, repacked.data(), repacked.size());
++            soa_staging.erase(tensor);
++        }
++        return;
++    }
++
+     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+ 
+     vk_context cpy_ctx;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+index ad5f652..c5b2101 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+@@ -126,7 +126,34 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+ }
+ #endif
+ 
++#if defined(TERNARY_SOA)
++// SoA-repacked layout accessors (see mul_mat_vec_iface.glsl / ggml-vulkan.cpp):
++// group of 64 blocks = [64 x f16 d][64 x 16B qs], 1152 B / group.
++uint soa_qs_word(uint ibg, uint w) {
++    return data_a_soa_qs[(ibg >> 6) * 288u + 32u + (ibg & 63u) * 4u + w];
++}
++float soa_d(uint ibg) {
++    return float(data_a_soa_d[(ibg >> 6) * 576u + (ibg & 63u)]);
++}
++#endif
++
+ #if defined(DATA_A_Q1_0)
++#if defined(TERNARY_SOA)
++vec2 dequantize(uint ib, uint iqs, uint a_offset) {
++    const uint bits = soa_qs_word(a_offset + ib, iqs >> 5u) >> (iqs & 31u);
++    return vec2(
++        (bits & 1u) != 0u ? 1.0f : -1.0f,
++        (bits & 2u) != 0u ? 1.0f : -1.0f);
++}
++vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
++    const uint bits = soa_qs_word(a_offset + ib, iqs >> 5u) >> (iqs & 31u);
++    return vec4(
++        (bits & 1u) != 0u ? 1.0f : -1.0f,
++        (bits & 2u) != 0u ? 1.0f : -1.0f,
++        (bits & 4u) != 0u ? 1.0f : -1.0f,
++        (bits & 8u) != 0u ? 1.0f : -1.0f);
++}
++#else
+ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 8u]) >> (iqs % 8u);
+     return vec2(
+@@ -142,6 +169,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+         (bits & 8u) != 0u ? 1.0f : -1.0f);
+ }
+ #endif
++#endif
+ 
+ #if defined(DATA_A_Q2_0)
+ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+@@ -550,8 +578,12 @@ vec2 get_dm(uint ib, uint a_offset) {
+ 
+ #if defined(DATA_A_Q1_0)
+ vec2 get_dm(uint ib, uint a_offset) {
++#if defined(TERNARY_SOA)
++    return vec2(soa_d(a_offset + ib), 0);
++#else
+     const float d = float(data_a[a_offset + ib].d);
+     return vec2(d, 0);
++#endif
+ }
+ #endif
+ 
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
-index 5a9d0e7..2fe9400 100644
+index 5a9d0e7..ef6a3e5 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
-@@ -7,7 +7,11 @@
+@@ -1,13 +1,26 @@
+ #version 450
+ 
+ #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++#if defined(TERNARY_F16) || defined(TERNARY_LUT)
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#endif
+ 
+ #include "mul_mat_vec_base.glsl"
+ #include "dequant_funcs.glsl"
  
  layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
  
 -#if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
++#if defined(TERNARY_LUT)
++// nibble of Q1_0 sign bits -> 4 f16 values in {-1,+1}; one ds_read_b64 replaces
++// 4x (bfe + cvt) and removes the sum(b) correction term entirely.
++shared f16vec4 ter_lut[16];
++#endif
++
 +#if defined(TERNARY_WIDE)
 +// Binary/ternary formats use a dedicated wide path: 32 weights per thread per
 +// iteration, loaded through the packed16 alias instead of per-byte accesses.
@@ -96,7 +459,7 @@ index 5a9d0e7..2fe9400 100644
  #define K_PER_ITER 8
  #else
  #define K_PER_ITER 4
-@@ -42,6 +46,79 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter,
+@@ -42,6 +55,161 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter,
      }
  }
  
@@ -119,13 +482,42 @@ index 5a9d0e7..2fe9400 100644
 +    const uint iqs = col%QUANT_K;
 +
 +    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++#if defined(TERNARY_LUT)
++        f16vec4 bv[8];
++        [[unroll]] for (uint x = 0; x < 8; ++x) {
++            bv[x] = f16vec4(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4 + x]));
++        }
++#elif defined(TERNARY_F16)
++        // f16 staging: halves the VGPRs held across the row loop (8 vs 16 for
++        // the activations) and lets the dot product run on packed v_pk_fma_f16.
++        // The correction term sumb stays fp32; f16 exposure is limited to a
++        // 32-element partial sum folded into an fp32 accumulator per chunk.
++        f16vec4 bv[8];
++        vec4 sumb4 = vec4(0.0f);
++        [[unroll]] for (uint x = 0; x < 8; ++x) {
++            const vec4 bx = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4 + x]);
++            bv[x] = f16vec4(bx);
++            sumb4 += bx;
++        }
++#elif defined(TERNARY_NOB)
++        // Debug probe: skip the activation loads entirely (results are wrong).
++        // Used to attribute matvec time to the B load stream.
++        vec4 bv[8];
++        vec4 sumb4 = vec4(8.0f);
++        [[unroll]] for (uint x = 0; x < 8; ++x) {
++            bv[x] = vec4(1.0f);
++        }
++#else
 +        vec4 bv[8];
 +        vec4 sumb4 = vec4(0.0f);
 +        [[unroll]] for (uint x = 0; x < 8; ++x) {
 +            bv[x] = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + col) / 4 + x]);
 +            sumb4 += bv[x];
 +        }
++#endif
++#if !defined(TERNARY_LUT)
 +        const float sumb = sumb4.x + sumb4.y + sumb4.z + sumb4.w;
++#endif
 +
 +        uint ibi = first_row*p.ncols;
 +        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -134,8 +526,33 @@ index 5a9d0e7..2fe9400 100644
 +
 +#if defined(DATA_A_Q1_0)
 +            const uint qsi = iqs/16;
++#if defined(TERNARY_NOA)
++            // Debug probe: skip the weight loads entirely (results are wrong).
++            // Used to attribute matvec time to the A load stream.
++            const uint bits = 0xAAAAAAAAu;
++#elif defined(TERNARY_SOA)
++            // One aligned, lane-coalesced dword covers all 32 weights.
++            const uint bits = soa_qs_word(a_offset + ib, iqs >> 5);
++#else
 +            const uint bits = uint(data_a_packed16[a_offset + ib].qs[qsi])
 +                            | (uint(data_a_packed16[a_offset + ib].qs[qsi + 1]) << 16);
++#endif
++#if defined(TERNARY_LUT)
++            f16vec4 acc = f16vec4(0.0);
++            [[unroll]] for (uint x = 0; x < 8; ++x) {
++                acc = fma(ter_lut[(bits >> (4*x)) & 0xfu], bv[x], acc);
++            }
++            const float t = float(acc.x) + float(acc.y) + float(acc.z) + float(acc.w);
++#elif defined(TERNARY_F16)
++            f16vec4 acc = f16vec4(0.0);
++            [[unroll]] for (uint x = 0; x < 8; ++x) {
++                acc = fma(f16vec4(float16_t((bits >> (4*x+0)) & 1u),
++                                  float16_t((bits >> (4*x+1)) & 1u),
++                                  float16_t((bits >> (4*x+2)) & 1u),
++                                  float16_t((bits >> (4*x+3)) & 1u)), bv[x], acc);
++            }
++            const float t = float(acc.x) + float(acc.y) + float(acc.z) + float(acc.w);
++#else
 +            vec4 acc = vec4(0.0f);
 +            [[unroll]] for (uint x = 0; x < 8; ++x) {
 +                acc = fma(vec4(float((bits >> (4*x+0)) & 1u),
@@ -143,15 +560,42 @@ index 5a9d0e7..2fe9400 100644
 +                               float((bits >> (4*x+2)) & 1u),
 +                               float((bits >> (4*x+3)) & 1u)), bv[x], acc);
 +            }
-+            const float d = float(data_a_packed16[a_offset + ib].d);
 +            const float t = acc.x + acc.y + acc.z + acc.w;
++#endif
++#if defined(TERNARY_NOA)
++            const float d = 1.0f;
++#elif defined(TERNARY_SOA)
++            const float d = soa_d(a_offset + ib);
++#else
++            const float d = float(data_a_packed16[a_offset + ib].d);
++#endif
++#if defined(TERNARY_LUT)
++            temp[j][n] += FLOAT_TYPE(d * t);
++#else
 +            temp[j][n] += FLOAT_TYPE(d * fma(2.0f, t, -sumb));
++#endif
 +#else // DATA_A_Q2_0
 +            const uint qsi = iqs/8;
 +            const uint bits0 = uint(data_a_packed16[a_offset + ib].qs[qsi])
 +                             | (uint(data_a_packed16[a_offset + ib].qs[qsi + 1]) << 16);
 +            const uint bits1 = uint(data_a_packed16[a_offset + ib].qs[qsi + 2])
 +                             | (uint(data_a_packed16[a_offset + ib].qs[qsi + 3]) << 16);
++#if defined(TERNARY_F16)
++            f16vec4 acc = f16vec4(0.0);
++            [[unroll]] for (uint x = 0; x < 4; ++x) {
++                acc = fma(f16vec4(float16_t((bits0 >> (8*x+0)) & 3u),
++                                  float16_t((bits0 >> (8*x+2)) & 3u),
++                                  float16_t((bits0 >> (8*x+4)) & 3u),
++                                  float16_t((bits0 >> (8*x+6)) & 3u)), bv[x], acc);
++            }
++            [[unroll]] for (uint x = 0; x < 4; ++x) {
++                acc = fma(f16vec4(float16_t((bits1 >> (8*x+0)) & 3u),
++                                  float16_t((bits1 >> (8*x+2)) & 3u),
++                                  float16_t((bits1 >> (8*x+4)) & 3u),
++                                  float16_t((bits1 >> (8*x+6)) & 3u)), bv[4+x], acc);
++            }
++            const float t = float(acc.x) + float(acc.y) + float(acc.z) + float(acc.w);
++#else
 +            vec4 acc = vec4(0.0f);
 +            [[unroll]] for (uint x = 0; x < 4; ++x) {
 +                acc = fma(vec4(float((bits0 >> (8*x+0)) & 3u),
@@ -165,8 +609,9 @@ index 5a9d0e7..2fe9400 100644
 +                               float((bits1 >> (8*x+4)) & 3u),
 +                               float((bits1 >> (8*x+6)) & 3u)), bv[4+x], acc);
 +            }
-+            const float d = float(data_a_packed16[a_offset + ib].d);
 +            const float t = acc.x + acc.y + acc.z + acc.w;
++#endif
++            const float d = float(data_a_packed16[a_offset + ib].d);
 +            temp[j][n] += FLOAT_TYPE(d * (t - sumb));
 +#endif
 +        }
@@ -176,7 +621,7 @@ index 5a9d0e7..2fe9400 100644
  void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
  {
      [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-@@ -113,6 +190,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+@@ -113,6 +281,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
          }
      }
  }
@@ -184,6 +629,151 @@ index 5a9d0e7..2fe9400 100644
  
  #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
  void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i)
+@@ -141,6 +310,16 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
+ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     const uint tid = gl_LocalInvocationID.x;
+ 
++#if defined(TERNARY_LUT)
++    if (tid < 16) {
++        ter_lut[tid] = f16vec4((tid & 1u) != 0u ? 1.0 : -1.0,
++                               (tid & 2u) != 0u ? 1.0 : -1.0,
++                               (tid & 4u) != 0u ? 1.0 : -1.0,
++                               (tid & 8u) != 0u ? 1.0 : -1.0);
++    }
++    barrier();
++#endif
++
+     get_offsets(a_offset, b_offset, d_offset);
+     const bool is_aligned_nonquant =
+         p.batch_stride_b % 4 == 0 && b_offset % 4 == 0 &&
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
+index e8d053c..20163df 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
+@@ -15,6 +15,13 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
+ #if defined(A_TYPE_PACKED32)
+ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+ #endif
++#if defined(TERNARY_SOA)
++// SoA-repacked binary/ternary weights: groups of 64 blocks laid out as
++// [64 x f16 d][64 x 16B qs] (1152 bytes per group). See ggml-vulkan.cpp
++// repack_q1_0_soa.
++layout (binding = 0) readonly buffer A_SOA_D  {float16_t data_a_soa_d[];};
++layout (binding = 0) readonly buffer A_SOA_QS {uint data_a_soa_qs[];};
++#endif
+ 
+ layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+ #ifdef B_TYPEV2
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
+index 89346e4..9250844 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
+@@ -62,6 +62,18 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
+ #if defined(A_TYPE_PACKED32)
+ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+ #endif
++#if defined(TERNARY_SOA)
++// SoA-repacked binary/ternary weights: groups of 64 blocks laid out as
++// [64 x f16 d][64 x 16B qs] (1152 bytes per group). See ggml-vulkan.cpp.
++layout (binding = 0) readonly buffer A_SOA_D  {float16_t data_a_soa_d[];};
++layout (binding = 0) readonly buffer A_SOA_QS {uint data_a_soa_qs[];};
++uint soa_qs_word(uint ibg, uint w) {
++    return data_a_soa_qs[(ibg >> 6) * 288u + 32u + (ibg & 63u) * 4u + w];
++}
++float soa_d(uint ibg) {
++    return float(data_a_soa_d[(ibg >> 6) * 576u + (ibg & 63u)]);
++}
++#endif
+ 
+ layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+@@ -257,8 +269,21 @@ void main() {
+     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col; i++) {
+         sums[i] = coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+     }
++#else
++#if defined(PACKED_K)
++#if defined(DATA_A_F32) || defined(DATA_A_F16)
++#error "PACKED_K is only implemented for the quantized (FLOAT_TYPEV2 cache) path"
++#endif
++    // Packed-k accumulation: one ACC_TYPEV2 accumulator per output element,
++    // whose two lanes hold partial sums for even/odd k. Each k-pair costs a
++    // single packed fma (v_pk_fma_f16 on GCN/RDNA with f16 accumulators)
++    // instead of two scalar f16 fmas, which run at half the packed rate.
++    // The lanes are folded back into the pairwise output layout after the k
++    // loop, so the store code below is unchanged.
++    ACC_TYPEV2 sums[WMITER * TM * WNITER * TN];
+ #else
+     ACC_TYPEV2 sums[WMITER * TM * WNITER * TN/2];
++#endif
+ #if defined(DATA_A_F32) || defined(DATA_A_F16)
+     FLOAT_TYPEV4 cache_a[WMITER * TM];
+     FLOAT_TYPEV4 cache_b;
+@@ -267,7 +292,7 @@ void main() {
+     FLOAT_TYPEV2 cache_b;
+ #endif
+ 
+-    [[unroll]] for (uint i = 0; i < WMITER*TM*WNITER*TN/2; i++) {
++    [[unroll]] for (uint i = 0; i < sums.length(); i++) {
+         sums[i] = ACC_TYPEV2(0.0f, 0.0f);
+     }
+ #endif
+@@ -326,6 +351,13 @@ void main() {
+                 #endif
+ 
+                     [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
++#if defined(PACKED_K)
++                        [[unroll]] for (uint cr = 0; cr < TM; cr++) {
++                            // [WNITER][TN][WMITER][TM] -> [wsic][cc][wsir][cr]
++                            const uint sums_idx = (wsic * TN + cc) * WMITER * TM + wsir * TM + cr;
++                            sums[sums_idx] = fma(ACC_TYPEV2(cache_a[wsir * TM + cr]), ACC_TYPEV2(cache_b), sums[sums_idx]);
++                        }
++#else
+                         [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
+                             // [WNITER][TN][WMITER][TM / 2] -> [wsic][cc][wsir][cr]
+                             const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+@@ -339,6 +371,7 @@ void main() {
+                             sums[sums_idx].y = fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].x), ACC_TYPE(cache_b.x), fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].y), ACC_TYPE(cache_b.y), sums[sums_idx].y));
+                         #endif
+                         }
++#endif
+                     }
+                 }
+             }
+@@ -349,6 +382,15 @@ void main() {
+         barrier();
+     }
+ 
++#if defined(PACKED_K) && !defined(COOPMAT)
++    // Fold the even/odd-k lanes into the pairwise output layout the store
++    // code expects: reduced element i covers outputs 2i and 2i+1. In-place is
++    // safe because element i is written after elements 2i and 2i+1 are read.
++    [[unroll]] for (uint i = 0; i < WMITER*TM*WNITER*TN/2; i++) {
++        sums[i] = ACC_TYPEV2(sums[2*i].x + sums[2*i].y, sums[2*i+1].x + sums[2*i+1].y);
++    }
++#endif
++
+ #if defined(ACC_TYPE_MAX)
+ #ifdef COOPMAT
+     [[unroll]] for (uint j = 0; j < cms_per_row * cms_per_col; j++) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
+index 00f2f7e..e31d474 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
+@@ -137,8 +137,13 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             const uint ib = idx / 16;
+             const uint iqs = idx & 0xfu;
+ 
++#if defined(TERNARY_SOA)
++            const float d = soa_d(ib);
++            const uint bits = (soa_qs_word(ib, iqs >> 2) >> ((iqs & 3u) * 8u)) & 0xffu;
++#else
+             const float d = float(data_a[ib].d);
+             const uint bits = uint(data_a[ib].qs[iqs]);
++#endif
+ 
+             buf_a[buf_idx    ] = FLOAT_TYPEV2((bits & 0x01u) != 0u ? d : -d, (bits & 0x02u) != 0u ? d : -d);
+             buf_a[buf_idx + 1] = FLOAT_TYPEV2((bits & 0x04u) != 0u ? d : -d, (bits & 0x08u) != 0u ? d : -d);
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
 index f31d79a..b6dc42d 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
@@ -231,10 +821,38 @@ index f31d79a..b6dc42d 100644
  
  
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index fc0dd01..4d28ae3 100644
+index fc0dd01..edf6e11 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -701,6 +701,18 @@ void process_shaders() {
+@@ -582,6 +582,27 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+         if (!coopmat2) {
+             string_to_spv(shader_name + "_" + tname + "_f32",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+             string_to_spv(shader_name + "_" + tname + "_f32_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
++
++            // Packed-k f16 variants for the binary/ternary quants: one
++            // v_pk_fma_f16 per k-pair instead of two scalar v_fma_f16 (GCN
++            // runs scalar f16 fma at fp32 rate; only the packed op is double
++            // rate). Selected at runtime via GGML_VK_MM_PACKED.
++            if (!coopmat && fp16 && f16acc && matmul_id_type == MatMulIdType::NONE
++                && (tname == "q1_0" || tname == "q2_0")) {
++                string_to_spv(shader_name + "_" + tname + "_f32_pk",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
++                string_to_spv(shader_name + "_" + tname + "_f32_pk_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
++            }
++
++            // SoA-repacked A variants (GGML_VK_TERNARY_SOA=1) for q1_0:
++            // plain (all acc) and packed-k (f16acc) forms.
++            if (!coopmat && !coopmat2 && matmul_id_type == MatMulIdType::NONE && tname == "q1_0") {
++                string_to_spv(shader_name + "_" + tname + "_f32_soa",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"TERNARY_SOA", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
++                string_to_spv(shader_name + "_" + tname + "_f32_soa_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"TERNARY_SOA", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
++                if (fp16 && f16acc) {
++                    string_to_spv(shader_name + "_" + tname + "_f32_pk_soa",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"TERNARY_SOA", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
++                    string_to_spv(shader_name + "_" + tname + "_f32_pk_soa_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"PACKED_K", "1"}, {"TERNARY_SOA", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
++                }
++            }
+         }
+ 
+         if (tname != "f16" && tname != "f32") {
+@@ -701,6 +722,57 @@ void process_shaders() {
          string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
          string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
  
@@ -248,12 +866,51 @@ index fc0dd01..4d28ae3 100644
 +            string_to_spv("mul_mat_vec_" + tname + "_wide_f16_f32_subgroup", shader, merge_maps(base_dict, {{"TERNARY_WIDE", "1"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
 +            string_to_spv("mul_mat_vec_" + tname + "_wide_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"TERNARY_WIDE", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 +            string_to_spv("mul_mat_vec_" + tname + "_wide_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"TERNARY_WIDE", "1"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
++
++            // wide16: fp16 staging + packed f16 accumulation (v_pk_fma_f16).
++            // Halves the registers pinned across the row loop and the fma
++            // count; the block-scale correction stays fp32. Runtime opt-in
++            // via GGML_VK_TERNARY_F16.
++            const std::vector<std::pair<std::string, std::map<std::string, std::string>>> wide16_variants = {
++                {"", {}},
++                {"_subgroup", {{"USE_SUBGROUP_ADD", "1"}}},
++                {"_subgroup_no_shmem", {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}},
++            };
++            for (const auto &wv : wide16_variants) {
++                string_to_spv("mul_mat_vec_" + tname + "_wide16_f32_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_F16", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
++                string_to_spv("mul_mat_vec_" + tname + "_wide16_f16_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_F16", "1"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
++            }
++
++            // Debug probes (wrong results, timing only): skip the B or A load
++            // stream to attribute matvec time. GGML_VK_TERNARY_DEBUG=nob|noa.
++            if (tname == "q1_0") {
++                for (const auto &wv : wide16_variants) {
++                    string_to_spv("mul_mat_vec_" + tname + "_widenob_f32_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_NOB", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
++                    string_to_spv("mul_mat_vec_" + tname + "_widenoa_f32_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_NOA", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
++                }
++            }
++
++            // SoA-repacked variants (GGML_VK_TERNARY_SOA=1): weights stored as
++            // [d plane][qs plane] per 64-block group; qs becomes one coalesced
++            // dword load per 32 weights. Wide (n==1) and generic (n>1) paths.
++            // widelut additionally maps sign-bit nibbles to f16vec4(+-1) via a
++            // 16-entry LDS table (GGML_VK_TERNARY_LUT=1, implies SOA).
++            if (tname == "q1_0") {
++                for (const auto &wv : wide16_variants) {
++                    string_to_spv("mul_mat_vec_" + tname + "_widelut_f32_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_SOA", "1"}, {"TERNARY_LUT", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
++                    string_to_spv("mul_mat_vec_" + tname + "_widelut_f16_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_SOA", "1"}, {"TERNARY_LUT", "1"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
++                    string_to_spv("mul_mat_vec_" + tname + "_widesoa_f32_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_SOA", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
++                    string_to_spv("mul_mat_vec_" + tname + "_soa_f32_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_SOA", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
++                    string_to_spv("mul_mat_vec_" + tname + "_widesoa_f16_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_WIDE", "1"}, {"TERNARY_SOA", "1"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
++                    string_to_spv("mul_mat_vec_" + tname + "_soa_f16_f32" + wv.first, shader, merge_maps(merge_maps(base_dict, wv.second), {{"TERNARY_SOA", "1"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
++                }
++            }
 +        }
 +
          string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
          string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
          string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
-@@ -1156,6 +1168,14 @@ void write_output_files() {
+@@ -1156,6 +1228,30 @@ void write_output_files() {
              src << "const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3] = {mul_mat_vec_" << tname << "_" << btype << "_f32_data, mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_data, mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_no_shmem_data};\n";
              src << "const uint64_t arr_dmmv_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
          }
@@ -263,6 +920,22 @@ index fc0dd01..4d28ae3 100644
 +            if (basename(input_filepath) == "mul_mat_vec.comp") {
 +                src << "const void * arr_dmmv_"   << tname << "_wide_" << btype << "_f32_data[3] = {mul_mat_vec_" << tname << "_wide_" << btype << "_f32_data, mul_mat_vec_" << tname << "_wide_" << btype << "_f32_subgroup_data, mul_mat_vec_" << tname << "_wide_" << btype << "_f32_subgroup_no_shmem_data};\n";
 +                src << "const uint64_t arr_dmmv_" << tname << "_wide_" << btype << "_f32_len[3] =  {mul_mat_vec_" << tname << "_wide_" << btype << "_f32_len,  mul_mat_vec_" << tname << "_wide_" << btype << "_f32_subgroup_len, mul_mat_vec_"  << tname << "_wide_" << btype << "_f32_subgroup_no_shmem_len};\n";
++            }
++            hdr << "extern const void * arr_dmmv_"   << tname << "_wide16_" << btype << "_f32_data[3];\n";
++            hdr << "extern const uint64_t arr_dmmv_" << tname << "_wide16_" << btype << "_f32_len[3];\n";
++            if (tname == "q1_0") {
++                for (const std::string& probe : (btype == "f32" ? std::vector<std::string>{"widenob", "widenoa", "widesoa", "soa", "widelut"} : std::vector<std::string>{"widesoa", "soa", "widelut"})) {
++                    hdr << "extern const void * arr_dmmv_"   << tname << "_" << probe << "_" << btype << "_f32_data[3];\n";
++                    hdr << "extern const uint64_t arr_dmmv_" << tname << "_" << probe << "_" << btype << "_f32_len[3];\n";
++                    if (basename(input_filepath) == "mul_mat_vec.comp") {
++                        src << "const void * arr_dmmv_"   << tname << "_" << probe << "_" << btype << "_f32_data[3] = {mul_mat_vec_" << tname << "_" << probe << "_" << btype << "_f32_data, mul_mat_vec_" << tname << "_" << probe << "_" << btype << "_f32_subgroup_data, mul_mat_vec_" << tname << "_" << probe << "_" << btype << "_f32_subgroup_no_shmem_data};\n";
++                        src << "const uint64_t arr_dmmv_" << tname << "_" << probe << "_" << btype << "_f32_len[3] =  {mul_mat_vec_" << tname << "_" << probe << "_" << btype << "_f32_len,  mul_mat_vec_" << tname << "_" << probe << "_" << btype << "_f32_subgroup_len, mul_mat_vec_"  << tname << "_" << probe << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
++                    }
++                }
++            }
++            if (basename(input_filepath) == "mul_mat_vec.comp") {
++                src << "const void * arr_dmmv_"   << tname << "_wide16_" << btype << "_f32_data[3] = {mul_mat_vec_" << tname << "_wide16_" << btype << "_f32_data, mul_mat_vec_" << tname << "_wide16_" << btype << "_f32_subgroup_data, mul_mat_vec_" << tname << "_wide16_" << btype << "_f32_subgroup_no_shmem_data};\n";
++                src << "const uint64_t arr_dmmv_" << tname << "_wide16_" << btype << "_f32_len[3] =  {mul_mat_vec_" << tname << "_wide16_" << btype << "_f32_len,  mul_mat_vec_" << tname << "_wide16_" << btype << "_f32_subgroup_len, mul_mat_vec_"  << tname << "_wide16_" << btype << "_f32_subgroup_no_shmem_len};\n";
 +            }
 +        }
  
