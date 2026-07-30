@@ -189,14 +189,35 @@ from `patches/`), and deploys to the rig as a nix closure with its own Mesa — 
 - `llama-bench` tg is still unusable on this arch; decode numbers above are
   `llama-completion` with real contexts, `--temp 0`, fixed 128 tokens.
 
-## 5c. ROCm/HIP bring-up status (blocked on rig access)
+## 5c. ROCm/HIP baseline — works on gfx900, loses to Vulkan
 
-nixpkgs ROCm **7.2.3 still ships gfx900 targets** — the closure (3.85 GB) built first try
-with `GGML_HIP=ON` + `gfx900` and is on the rig. Bring-up fixed in sequence: nixpkgs
-`libLLVM` needs AVX (rig's Celeron has none) → interposed AMD's official generic-x86 comgr
-build; `rocminfo` then enumerates all 7 gfx900 agents. Last blocker found: a truncated
-`libdrm_amdgpu.so` from an interrupted rsync. While replacing it the rig's sshd stopped
-accepting connections (ping OK) — needs a reboot/check before the first HIP benchmark.
+nixpkgs ROCm **7.2.3 still ships gfx900 targets**; the HIP closure built first try and
+**all 7 Vega 56 enumerate as ROCm devices** on the HiveOS 6.6 kernel. Bring-up fixes, in
+order: (1) nixpkgs `libLLVM` assumes AVX → SIGILL on the rig's Celeron; worked around by
+interposing AMD's official generic-x86 comgr (`/root/bonsai/stub`, with nix zlib/zstd
+symlinks — the HIP runtime resolves comgr purely via dlsym, zero named imports).
+(2) A truncated `libdrm_amdgpu.so` from an interrupted rsync — the failure mode that
+motivated installing Nix on the rig (see §5d). One watchdog reboot occurred during
+bring-up with the corrupt lib; the full matrix ran stable afterwards.
+
+Measured, single Vega 56, Q1_0:
+
+| | tg128 | pp512 |
+|---|---|---|
+| ROCm (fa, q4 KV) | 12.0 t/s | **35.0** |
+| Vulkan patched (same feats) | **14.9–15.1 t/s** | **98.9** |
+
+**Verdict: Vulkan wins decisively on gfx900** — decode +25%, prefill 2.8×. Without dp4a
+the HIP quant paths can't compete, exactly as `ANALYSIS.md` §6.4 predicted. ROCm stays a
+recorded baseline, not a direction.
+
+## 5d. Deployment: Nix installed on the rig
+
+Single-user Nix 2.35.1 now runs on the rig (nixbld group created; binaries symlinked to
+`/usr/local/bin`; `nix-command flakes` enabled). Deploys are now
+`nix copy --to ssh://root@100.95.237.97 --no-check-sigs ./result-runtime` — hash-verified
+and registered, no more silent truncation. The earlier rsync-shipped paths were
+re-registered by the first `nix copy`.
 
 ## 6. Next steps, in priority order
 
