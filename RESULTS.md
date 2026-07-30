@@ -165,6 +165,39 @@ Gotchas: `llama-cli` rejects `-no-cnv` ("use llama-completion instead"); `llama-
 
 ---
 
+## 5b. Optimization round 1 (2026-07-30 afternoon) — +15% decode, reproducible builds
+
+Everything now builds from `flake.nix` (pinned nixpkgs + prism `b9596`, patches applied
+from `patches/`), and deploys to the rig as a nix closure with its own Mesa — the rig's
+2023 driver stack is no longer a variable.
+
+| Config | Decode | pp512 |
+|---|---|---|
+| Original prebuilt + Mesa 23.2.1 | 13.14 t/s | 92.3 |
+| Same code, **Mesa 26.1.5** (nix closure) | 13.81 t/s | 98.9 |
+| + `patches/0001` wide ternary matvec, `GGML_VK_TERNARY_ROWS=8` | **14.90–15.08 t/s** | 98.9 |
+
+- The patch: dedicated n==1 `mul_mat_vec` variant for Q1_0/Q2_0 — 32 weights/thread/iter
+  via packed16 loads, activations staged in registers across rows, dot computed as
+  `fma(code, b) − sum(b)` without materializing weights. Generic path kept for batch 2–8
+  (the wide variant's register pressure regresses it). Greedy outputs identical to baseline.
+- Knobs added: `GGML_VK_TERNARY_ROWS` (8 optimal; 16 worse — VGPR limit),
+  `GGML_VK_GCN_SUBGROUP_REDUCE` (≈1% — GCN's shmem reduction wasn't the bottleneck).
+- Per-op profile after patch: big matvec 186→155 µs, still only ~81 GB/s of 410 —
+  **latency/occupancy-bound, not instruction-bound**. Next 2× needs fp16 packed math or a
+  fundamentally different tiling, plus the ~14 ms/token of small-op dispatch overhead.
+- `llama-bench` tg is still unusable on this arch; decode numbers above are
+  `llama-completion` with real contexts, `--temp 0`, fixed 128 tokens.
+
+## 5c. ROCm/HIP bring-up status (blocked on rig access)
+
+nixpkgs ROCm **7.2.3 still ships gfx900 targets** — the closure (3.85 GB) built first try
+with `GGML_HIP=ON` + `gfx900` and is on the rig. Bring-up fixed in sequence: nixpkgs
+`libLLVM` needs AVX (rig's Celeron has none) → interposed AMD's official generic-x86 comgr
+build; `rocminfo` then enumerates all 7 gfx900 agents. Last blocker found: a truncated
+`libdrm_amdgpu.so` from an interrupted rsync. While replacing it the rig's sshd stopped
+accepting connections (ping OK) — needs a reboot/check before the first HIP benchmark.
+
 ## 6. Next steps, in priority order
 
 1. **Multi-GPU scaling.** 7 idle cards on x16 links. Layer-split 2–4 cards for Q2_0 (better
