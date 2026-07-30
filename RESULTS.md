@@ -245,3 +245,49 @@ re-registered by the first `nix copy`.
   end** (peak swap use 25 MiB); remove with `swapoff /swapfile.bonsai && rm /swapfile.bonsai`
 - `/root/models/` (10.9 GB of GGUFs), `/root/bonsai/` (binaries, logs, `bench-v1.sh`, `vram.sh`)
 - No miners were running before or after; no HiveOS services altered; all 7 GPUs idle at 7 MiB
+
+## 5e. Optimization round 2 (2026-07-30/31 evening) — decode +42%, prefill +53%
+
+Goal set: PP 1000 / TG 30 aspirational. Final state this round (patch v8, one env set):
+
+| metric | baseline | round 1 | **round 2** | config |
+|---|---|---|---|---|
+| decode | 13.14 t/s | 15.08 | **18.65 t/s** | `TERNARY_ROWS=8 GCN_SUBGROUP_REDUCE=1 TERNARY_SOA=1 TERNARY_LUT=1` |
+| pp512 | 92.3 t/s | 99.2 | **141.1** (135.1 with SoA on) | `MM_PACKED=1 TILE_M=256,128,64,32,32,64,2,4,4,1,64` |
+
+**What moved the needle:**
+1. **PACKED_K mul_mm** (`GGML_VK_MM_PACKED=1`): GCN runs *scalar* `v_fma_f16` at fp32 rate —
+   only `v_pk_fma_f16` is double-rate. Pairing even/odd k in the two lanes of one `f16vec2`
+   accumulator per output halves the FMA instruction count: pp512 98→131 (+33%).
+2. **Warptile override** (`GGML_VK_TILE_M`, runtime env, no rebuild): `mul_mat_l` is disabled
+   for q1_0 by the shmem check, so the *medium* tile is what actually runs. Scan found
+   128×64, BK=32, 4×wave64, TM=TN=4, WM=32/WN=64 → 141.1. (BK 16/64 −20%, bigger tiles worse.)
+3. **LDS lookup-table matvec** (`GGML_VK_TERNARY_LUT=1`): sign-bit nibble → `f16vec4(±1)` via a
+   16-entry shared table; one `ds_read_b64` + 2 packed FMAs per 8 weights replaces the
+   bfe+cvt+fma chains and eliminates the `sum(b)` correction. Decode 66.4 → 53.6 ms/token
+   (+24%), output **bit-identical**. Requires SoA (below).
+4. **SoA weight repack** (`GGML_VK_TERNARY_SOA=1`): Q1_0 mul_mat weights repacked at load into
+   [64×f16 d][64×16B qs] groups; qs becomes one lane-coalesced dword per 32 weights.
+   Perf-neutral alone (falsified the coalescing theory) but is the substrate for the LUT
+   kernel's single-dword bit loads. Gotcha: weights stream through
+   `ggml_backend_vk_set_tensor_2d_async` in chunks — repack hooks that path with a host shadow.
+
+**Falsified (measured, don't redo):** fp16 packing alone (cvt overhead, −9%); occupancy
+(7 waves vs 4 — no change); load coalescing alone (SoA neutral); LOAD_VEC_A=16 load_a (−5%,
+LDS write conflicts); BK_STEP=4 ds_read_b64 (neutral — ACO already merges); workgroup 128/256
+for matvec (−9/−19%); rows ≠ 8 for the wide path. The Q1_0 matvec was **ALU-bound**
+(~3 VALU/weight), not memory-bound: skip-A probe deltas overstated load cost because constant
+bits let the compiler fold the mask ALU.
+
+**Where the remaining time goes (decode, 53.6 ms):** ~33 ms matvec (floors: 9.2 ms DRAM,
+~3 ms pk-issue) + ~15-20 ms across ~450 tiny dispatches/token (GET_ROWS ×97, RMS_NORM ×129,
+SCALE/CPY/MUL/ADD/L2_NORM ~96 each — delta-net state plumbing, 10-35 µs flat each).
+Prefill: mul_mm at ~8.6 TFLOPS effective = 41% pk-issue efficiency; rest is load_a dequant +
+per-BK-tile barrier drains.
+
+**Round-3 roadmap (est. gains):** (a) fuse delta-net elementwise chains (SIGMOID+MUL gate,
+L2_NORM pairs, out-ids GET_ROWS elision at n==1) → decode −8-12 ms; (b) mul_mm LDS
+double-buffering to overlap tile loads with math → pp +15-25%; (c) generic n=2..8 dmmv is
+6.5× the n=1 cost per token (SoA generic path slow) — worth a look for short-prompt latency.
+Physics honesty: PP 1000 needs ~54 TFLOPS effective; the card's fp16 peak is 21 → ceiling
+~390, realistic ~250-300. TG 30 = 33 ms/token — reachable only with both (a) and more matvec.
