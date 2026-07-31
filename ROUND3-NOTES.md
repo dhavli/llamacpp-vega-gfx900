@@ -95,3 +95,10 @@ a NEW graph formulation: rows-read + single in-place state write WITHOUT snapsho
 state-write variant). That plus absorbing the GDN elementwise prologue (sigmoid/softplus/
 scale/L2_NORM) is the remaining TG path (~24 t/s est.) — novel design work, good candidate
 to sanity-check with the consultants once authenticated.
+
+UPDATE (v11.3, commit 6723976): the 4.0 t/s was NOT snapshot traffic — the ring conv path
+fed a strided view into im2col; Vulkan requires contiguous src1 → ~48 graph splits to the
+Celeron. Fixed with ggml_cont (delta-net-base.cpp): rows-active now 13.3 t/s all-GPU,
+md5-identical, zero rejections. Gathered (18.6) remains the decode default — the ring
+snapshot ops (~21 ms/token) outweigh the saved gathers. New diagnostic:
+GGML_VK_SOA_DEBUG=1 logs every supports_op rejection (how this was found).
