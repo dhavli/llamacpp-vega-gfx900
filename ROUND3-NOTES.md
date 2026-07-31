@@ -510,3 +510,45 @@ Build cost: 256 entries instead of 16, initialized once per workgroup (64 thread
 entries each) and amortized over the whole row block.
 Risk to watch: bank conflicts. 16 B per entry = 4 banks, so entries 8 apart collide;
 with 64 lanes reading unrelated bytes this could serialize. Must be measured, not assumed.
+
+### Round-4h: the byte-indexed LUT is ALSO refuted — and it explains why the nibble LUT wins
+
+Implemented `TERNARY_LUT8` (`GGML_VK_TERNARY_LUT8=1`, shader variant `widelut8`):
+256-entry table of `struct { f16vec4 lo; f16vec4 hi; }` = 4 KB LDS, one lookup per BYTE
+(8 weights) instead of per nibble (4 weights), halving LDS ops per weight.
+
+Measured at 1590 MHz (output md5 identical, so the implementation is correct):
+
+| variant | TG |
+|---|---|
+| nibble LUT + prefetch (default) | **25.87 / 25.55** |
+| byte LUT8 | 23.22 / 22.74 |
+
+**11% SLOWER.** Cause is almost certainly LDS bank conflicts. A 16-byte entry spans 4 of
+the 32 LDS banks, so entries 8 apart collide; with 64 lanes indexing effectively random
+bytes you get up to 8-way serialization, which costs more than halving the op count saves.
+
+**This retroactively explains why the nibble LUT is fast:** 16 entries x 8 B = 128 B maps
+1:1 onto bank pairs, so no two distinct entries ever share a bank — the table is exactly
+big enough to be **bank-conflict-free**, and any larger table gives that up. The lgkmcnt
+waits are real but they are conflict-free 2-bank reads, which is close to the best LDS
+can do.
+
+### Matvec status: a well-established local optimum
+Three independent directions now refuted by measurement, not argument:
+1. VGPR diet / higher occupancy — the *lower*-occupancy variant is faster.
+2. LDS -> ALU (pure ALU sign expansion) — 20% slower.
+3. Fewer/larger LDS reads (byte LUT) — 11% slower, bank conflicts.
+Plus previously: T-MAC activation LUT (adds LDS traffic = the bottleneck), fp16 staging,
+LOAD_VEC_A=16, mul_mm LDS double-buffering, ROCm.
+
+The knob is kept (default OFF, `widelut8` variant unused unless requested) as executable
+documentation of the falsification. Default config is unchanged and still measures 25.5-26.1.
+
+**Implication for the /goal (TG 30):** the mat-vec kernel is within a few percent of what
+this design can do on gfx900. Reaching 30 would need a different formulation, not tuning.
+The remaining structural idea is the GDN megakernel, but round-4's critical-path measurement
+showed most of that op time already overlaps with matvec work, so its headroom is much
+smaller than the raw per-op totals suggest. Honest assessment: **TG ~26 is close to the
+practical ceiling here**; PP has more room (it scales with core clock and is at 226 on the
+Vega 64 BIOS card).
