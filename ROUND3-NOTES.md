@@ -8,6 +8,15 @@ The scan-based matcher + sigglu shader landed; fires 16×/token (attention gates
 bit-identical, neutral timing. The remaining dispatch swarm is the 48 delta-net layers:
 GET_ROWS×2/SCALE/CPY/L2_NORM×2/CONCAT per layer — requires GDN-integrated state indexing
 (pass ids into GATED_DELTA_NET and index inside; graph + shader change).
+Sharpened diagnosis (2026-07-31): the ~15 ms/token small-op cost is BARRIER DRAINS on the
+dependent per-layer chain (~500-700 barriers x ~20 us GCN pipeline drain), not dispatch
+issue cost — zero-size ops are already skipped (ggml_vk_is_empty), sync elision already
+skips barriers between independent ops, and graph reordering cannot help a sequential
+dependent chain. Only fusing chain links helps: each fused pair removes one barrier.
+Ranked fusion candidates by links removed per layer (48 layers): state GET_ROWS into
+SSM_CONV/GDN (2), CPY/SET_ROWS state writeback into GDN (2), L2_NORM pair into GDN
+prologue (2), SCALE/SOFTPLUS/SIGMOID into GDN prologue (2-3). A GDN megakernel absorbing
+its elementwise prologue+epilogue could remove ~6-8 barriers/layer = ~6-8 ms/token -> ~24 t/s.
 Implementation entry points (ggml-vulkan.cpp, prism clone):
 - Fusion detection chain: ~line 15808-15861 (`ggml_vk_can_fuse(ctx, cgraph, i, {...})`
   else-if ladder inside graph build) — add `{GGML_OP_UNARY(SIGMOID), GGML_OP_MUL}` case here.
