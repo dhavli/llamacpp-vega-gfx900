@@ -228,3 +228,33 @@ benchmarks silently worthless. Three reboots were needed this session.
 3. GDN prologue fusion -- but size it off the critical path, not perf-logger totals.
 4. PP: equal-LDS double buffering (BK=32 x2); re-scan TILE_M at 1138 MHz since the
    compute/memory balance moved.
+
+### Round-4b: TILE_M re-scan at 1138 MHz — BK=64 wins (+4.9% PP)
+The warptile was tuned at 950 MHz; raising the clock moved the compute/memory balance
+and the optimum shifted. Swept BK only (it changes K-tile depth and LDS size but not
+output tiling geometry, so it cannot cause an OOB write / GPU hang):
+
+| BK | pp512 (--mmap 0, -r 3, repeated) |
+|---|---|
+| 16 | 83.4 (llama-bench w/ mmap; clearly bad) |
+| 32 | 160.68 / 160.58  <- previous best |
+| **64** | **168.47 / 168.44** |
+
+New best config (TG 21.56, pp512 168.38, prompt65 73.91):
+```
+GGML_VK_TERNARY_ROWS=8 GGML_VK_GCN_SUBGROUP_REDUCE=1 GGML_VK_TERNARY_SOA=1 \
+GGML_VK_TERNARY_LUT=1 GGML_VK_TERNARY_PREFETCH=1 GGML_VK_MM_PACKED=1 \
+GGML_VK_TILE_M=256,128,64,64,32,64,2,4,4,1,64
+```
+Warptile field order (confirmed from the code) is
+`{threads, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, subgroup}`, and `warps = threads/subgroup`.
+So this is 4x wave64, BM=128, BN=64, BK=64. LDS = (BM+BN)*(BK+bank)*2B ~= 27 KB at BK=64
+(~14 KB at BK=32) -- both well under the 64 KB/CU budget, which **disproves agy's claim**
+that the tile uses 48 KB and limits us to 1 WG/CU. Occupancy is not LDS-bound here, and
+BK=64 winning means more K-depth per tile beats extra occupancy.
+
+Measurement note: llama-bench with mmap has +-7 variance on this box; `--mmap 0 -r 3`
+gives +-0.1. Use the latter for any comparison under ~5%.
+Also: the ab-bench md5 captures stderr, so runs with a TILE_M banner have a different
+md5 than runs without. Decode correctness is pinned by the banner-free run (9e30dd54e452);
+TILE_M only affects mul_mm (prefill), not the n==1 matvec.
