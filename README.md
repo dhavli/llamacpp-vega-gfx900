@@ -27,8 +27,8 @@ output md5 verified identical at every step:
 
 | GPUs | pp512 | pp2048 | pp8192 | decode @5.6k ctx |
 |---|---|---|---|---|
-| **3** (`-c 8192`) | 521.1 | **641.0** | **584.9** | **30.84** |
-| 4 | 499.2 | 561.2 | 509.9 | (spilled — see below) |
+| **3** (`-c 8192`) | 521.1 | **641.0** | **584.9** | 30.84 |
+| **4** (`-c 8192`) | 499.2 | 561.2 | 509.9 | **32.19** |
 | 6 | 490.1 | 506.4 | 457.1 | 27.61 |
 
 A sparse 35B at 4-bit beats a hand-tuned dense 27B at 1.125 bpw on **both** axes on this
@@ -39,8 +39,40 @@ prefills at **624 t/s** and then generates at **30.8 t/s**.
 Note the direction: MoE prefill gets **worse** with more cards (641 → 561 → 506 at pp2048),
 the opposite of the dense model, which *gained* from 3 cards at long prompts. A3B does roughly
 a ninth of the matmul per token, so per-stage work is small relative to the fixed per-boundary
-copy — sparsity cuts compute but not the number of layer boundaries. Three cards is optimal on
-both axes, as long as the context fits.
+copy — sparsity cuts compute but not the number of layer boundaries. Decode peaks at **4**
+cards, not 3: at 3 cards VRAM sits at 7.0–7.2 GiB of 7.98 per card, and the slack from a fourth
+card outweighs the extra boundary. Past that, boundary cost dominates.
+
+### Long context and concurrent slots
+
+Only 10 of the 40 layers hold a KV cache (2 KV heads × 256 head_dim), so KV costs just
+**20 KB/token** — 2.62 GB at 128k, or 1.31 GB with `-ctk q8_0 -ctv q8_0`. That makes this model
+unusually cheap to serve at depth on 8 GB cards. Single slot, 6 cards, `-c 131072`:
+
+| KV type | prefill | decode |
+|---|---|---|
+| f16 | 418.1 | 8.99 |
+| **q8_0** | 475.5 | **21.00** |
+
+q8_0 KV is **mandatory** at long context, not an optimisation. A 2.3× decode difference cannot
+come from the bandwidth of an extra 1.3 GB (~6 ms/token at most against the 63 ms observed), so
+f16 at 128k is tipping a card into spill — the 10 attention layers don't divide evenly across
+6 devices, so one card takes several of them.
+
+Concurrent slots, all 6 cards, q8_0 KV, `-npp 8192 -ntg 128`:
+
+| slots | total ctx | prefill t/s | aggregate decode t/s | combined t/s |
+|---|---|---|---|---|
+| 2 | 262,144 | 437.3 | 33.92 | 369.6 |
+| 4 | 524,288 | 446.8 | 46.77 | 394.9 |
+| 8 | **1,048,576** | 445.2 | **56.10** | **402.2** |
+
+**8 slots × 128k allocates and runs on 6 × 8 GB.** Aggregate decode scales with slot count
+because batching amortises the per-boundary copy over more sequences, while prefill saturates
+at ~445 t/s regardless — so prefill is the binding constraint for serving, not decode. Caveat:
+KV is *allocated* for 128k/slot but only 8320 tokens/slot were populated here, so these decode
+figures are at shallow depth; expect roughly 25% less at genuinely full slots, extrapolating
+from the single-slot 27.6 @16k → 21.0 @128k measurement.
 
 ## What's in the patch
 
