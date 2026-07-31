@@ -180,6 +180,18 @@ The matvec is a well-established local optimum. All of these were built and meas
 - **Pre-formatted sign masks** (sign bits pre-placed at bit 15/31 of a dword so a `v_xor_b32`
   makes ±1 with no LDS): a 32-bit mask covering 2 weights is 16 bits of storage *per weight* —
   a 16× expansion that destroys the whole point of 1-bit weights.
+- **"Fast" warptiles that turned out to compute garbage.** Sweeping `GGML_VK_TILE_M` on the
+  Q4_K MoE path produced pp2048 of 996 (BK=32), 1128 (BN=256) and **1526** (TM=8) against the
+  GCN default's 506 — up to 3×. All three are **wrong**: under greedy decode with an identical
+  prompt, the default emits coherent text and TM=8 emits a run of `/` characters. They are fast
+  because they skip work.
+
+  This is a trap worth internalising: `llama-bench` never inspects output, and llama.cpp's
+  `ggml_vk_matmul_shmem_support` only validates that the tile *fits in LDS* — it does not check
+  that `BM`/`WM`/`WMITER`/`TM`/subgroup are geometrically consistent. An invalid tile therefore
+  loads, runs, and benchmarks beautifully. **Every warptile candidate must be output-diffed
+  against the default** (`llama-completion --temp 0 --ignore-eos`, byte-compare the
+  continuation) before its throughput means anything.
 
 ## Measurement lessons
 
