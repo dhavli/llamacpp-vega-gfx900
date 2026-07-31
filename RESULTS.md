@@ -291,3 +291,76 @@ double-buffering to overlap tile loads with math → pp +15-25%; (c) generic n=2
 6.5× the n=1 cost per token (SoA generic path slow) — worth a look for short-prompt latency.
 Physics honesty: PP 1000 needs ~54 TFLOPS effective; the card's fp16 peak is 21 → ceiling
 ~390, realistic ~250-300. TG 30 = 33 ms/token — reachable only with both (a) and more matvec.
+
+## 5f. Optimization rounds 3-4 (2026-07-31) — decode 26.1 t/s, prefill 226 t/s
+
+Supersedes the round-3 roadmap at the end of §5e; several of its assumptions were wrong.
+
+### Headline
+
+| | round-2 end | now | vs original baseline |
+|---|---|---|---|
+| decode (TG) | 18.67 | **26.06** t/s | 13.14 → +98% |
+| prefill pp512 | 141.1 | **225.9** t/s | 92.3 → +145% |
+| pp8192 | — | 156.4 (`-ub 1024`) | — |
+
+Best decode is card1 (stock BIOS, 1590 MHz); best prefill is card6 (Vega 64 BIOS,
+1750/945). Config: the §5e env plus `GGML_VK_TERNARY_PREFETCH=1` and
+`GGML_VK_TILE_M=256,128,64,64,32,64,2,4,4,1,64`, plus `-ub 1024` for long prompts.
+
+### The single biggest win had nothing to do with kernels
+**The GPUs were pinned to 950 MHz by a HiveOS mining profile that flattened every DPM
+state to 800 mV** — not the 1474 MHz stock boost every roofline in §4/§5e assumed. Raising
+the clock is worth +34% decode and +67% prefill on its own.
+
+A cautionary sequence: forcing higher DPM states while that 800 mV table was active hung
+the GPU (`amdgpu_job_timedout: ring comp_1.1.0 timeout`), which left unkillable D-state
+processes and wedged TTM kworkers, requiring a reboot — and silently poisoned every
+benchmark until then. I concluded from three such hangs that 1138 MHz was a hard ceiling
+and the card was degraded. **That was wrong.** Once the OC was cleared the real per-state
+voltages appeared (1269 needs 1000 mV, 1590 needs 1200 mV); my "fixes" at 900/950 mV were
+still under spec. At stock voltages the whole ladder to 1590 MHz is stable at 41 °C.
+**Always read `pp_od_clk_voltage` before forcing a DPM state.**
+
+### Corrected physics (§5e's numbers used the wrong clock)
+At 1590 MHz the fp16 packed peak is ~18 TFLOPS, not 21. PP 1000 would need ~54 TFLOPS
+effective — **physically impossible**. Realistic prefill ceiling is ~250-280.
+Decode: ~26 t/s is close to this kernel's practical limit (see refutations below).
+
+### Batch knobs: `-b` does nothing, `-ub` is prefill-only
+`-b` swept 512..8192 changes throughput by 0.1% (noise) — it only controls how many tokens
+reach `llama_decode` before being split into `-ub` chunks, so it never changes GEMM shapes.
+`-ub` matters only on long prompts and is **non-monotonic**: pp8192 = 119.8 (ub 512),
+134.7 (1024), 131.2 (1536), 137.9 (1792). `ub=2048` OOMs because the logits buffer is
+`n_vocab × ub × 4` and this model's vocab is 248320 → exactly 2.03 GB. Neither knob affects
+decode at all (7 combinations, 1.2% spread) since decode is n==1.
+
+### Multi-GPU was invisible, not absent
+`ggml_vk_instance_init` deduplicates physical devices by `deviceUUID`, and RADV reports the
+same UUID for every identical Vega in the rig, so 6 GPUs collapsed to one.
+**`GGML_VK_VISIBLE_DEVICES=N` skips that path** and reaches all of them (`N` → `card N+1`).
+
+### What the matvec is actually bound by, and what does NOT help
+ISA via `RADV_DEBUG=shaders` (`shaderstats` is silent on this build): `s_waitcnt lgkmcnt`
+(LDS) outnumbers `vmcnt` (VMEM) ~5:1, so the kernel is **LDS-stall bound**, not HBM bound.
+Confirmed independently: decode gained nothing from card6's +18% memory bandwidth while
+prefill gained +13% from its core clock.
+
+Refuted by measurement, not argument:
+- **Occupancy / VGPR diet** — the *lower*-occupancy variant is faster (63 VGPR / 4 waves →
+  26.01 vs 47 VGPR / 5 waves → 24.57). llama.cpp issue #20848's pathology does not transfer.
+- **LDS → ALU** sign expansion — 20% slower, despite ~18% VALU utilization.
+- **Byte-indexed LUT** (256 entries, half the LDS ops) — 11% slower from bank conflicts.
+  This explains why the shipped nibble LUT wins: 16 × 8 B = 128 B maps 1:1 onto bank pairs,
+  making it exactly large enough to be **bank-conflict-free**.
+- **T-MAC activation-side LUT** — dropped unbuilt; it adds LDS traffic, the actual bottleneck.
+
+### Measurement lessons worth keeping
+1. **Rank by critical path, not per-op totals.** Removing the 48 per-layer state gathers cut
+   2.45 ms of GPU op time but only 0.37 ms of wall clock — those gathers read the KV cache,
+   are independent of the current layer's activations, and already overlapped with matvec.
+2. **Decode is 100% GPU-bound**: 0 ms of process CPU over 10 s of steady decode.
+3. `llama-bench` with mmap has ±7 variance on this box; use `--mmap 0 -r 3` (±0.1) for
+   anything under 5%.
+4. The RADV dump interleaves backend IR with final ISA; only ISA lines carry a `; hexcode`
+   suffix. Counting IR as ISA reports max VGPR 4 — obvious nonsense, easy to believe.
