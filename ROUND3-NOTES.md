@@ -102,3 +102,129 @@ Celeron. Fixed with ggml_cont (delta-net-base.cpp): rows-active now 13.3 t/s all
 md5-identical, zero rejections. Gathered (18.6) remains the decode default — the ring
 snapshot ops (~21 ms/token) outweigh the saved gathers. New diagnostic:
 GGML_VK_SOA_DEBUG=1 logs every supports_op rejection (how this was found).
+
+---
+
+# Round-4 (2026-07-31): critical-path correction + consultant round
+
+## THE methodological correction — rank by critical path, not perf-logger total
+Implemented the snapshot-free K=1 GDN rows path (`build_recurrent_attn`: when
+`n_rs_seq == 0` and a backend supports rows mode, read state via `state_rows`
+instead of gather + slot-0 cpy; gate in qwen35.cpp no longer requires
+`n_rs_seq > 0`; `GGML_GDN_STATE_GATHER=1` restores the old path).
+
+Result: GET_ROWS 97 ops / 3.31 ms  ->  49 ops / 0.86 ms. Output BIT-IDENTICAL
+(md5 9e30dd54e452). GPU op time saved: 2.45 ms.
+Wall clock: 18.53 -> 18.66 t/s (53.96 -> 53.59 ms). **Only 0.37 ms.**
+
+Why: the state gather reads the KV cache and does NOT depend on the current
+layer's activations, so it was already overlapping with matvec execution. The
+perf logger serializes dispatches and therefore bills off-critical-path ops at
+full cost. **Do not size future work off GGML_VK_PERF_LOGGER totals.** Only ops
+on the dependent chain are worth removing.
+
+Kept anyway: bit-identical, small TG win, and a solid short-prefill win
+(65-token prompt eval 51.0 -> 60.3 t/s).
+
+## Decode is 100% GPU-bound
+Over 10 s of steady decode: 0 ms utime, 0 ms stime, 1 thread (command buffers
+reused, "graphs reused = 126"). The 2-core Celeron is NOT a decode bottleneck.
+Stop considering submission overhead.
+
+## Full per-token GPU profile (v11.3 + best env, GGML_VK_PERF_LOGGER=1, ~60 ms instrumented)
+Matvec (all q1_0, all on the critical path): ~39.9 ms total
+  m=17408 k=5120   128x 122.8 us = 15.72 ms   <- 12.5 MB in 122.8 us = 102 GB/s
+  m=5120  k=17408   64x 118.9 us =  7.61 ms   (MUL_MAT_ADD)
+  m=10240 k=5120    48x  82.7 us =  3.97 ms
+  m=6144  k=5120    48x  64.1 us =  3.08 ms
+  m=5120  k=6144    48x  51.1 us =  2.45 ms
+  m=48    k=5120    96x  23.8 us =  2.29 ms   <- alpha/beta projections, 20 GFLOPS, ~pure overhead
+  m=248320 (output head) 1x 1.22 ms
+Non-matvec: RMS_NORM_MUL 4.42, GET_ROWS 3.31 (now 0.86), CPY 2.08,
+  GATED_DELTA_NET 1.75, GLU 1.43, ADD 1.29, MUL 1.19, L2_NORM 1.15,
+  FLASH_ATTN 1.08, CONCAT 0.63, SOFTPLUS 0.63, SIGMOID 0.62, SILU 0.61,
+  ROPE 0.41, SET_ROWS 0.39, CONT 0.22
+
+## Matvec is LATENCY-bound, not ALU-bound (revises round-2 conclusion)
+102 GB/s = 25% of the 410 GB/s roofline. Instruction accounting for the LUT inner
+loop (per 4 weights: 1 bfe + 1 ds_read_b64 + 2 pk_fma) allows ~878 GB/s of weight
+traffic on VALU alone, so VALU is not binding. At 64 VGPR / 4-of-10 waves the wave
+issues one row's load, hits s_waitcnt, and eats a full ~350-cycle HBM latency with
+nothing to backfill.
+
+Rows-per-WG is saturated (sweep, bs=64): rows=4 -> 14.93, rows=8 -> 18.14,
+rows=12 -> 17.91, rows=16 -> 18.31. bs=128 uniformly worse (16.58 at rows=8) and
+changes the reduction order (different md5). rm_ter is capped at 16 in the host code.
+
+Next: `GGML_VK_TERNARY_PREFETCH=1` (new `widelutpf` shader variant) hoists all
+NUM_ROWS (weight-word, scale) loads ahead of the FMA chains -> 2*NUM_ROWS loads in
+flight before the first wait. Both consultants independently recommended exactly this.
+
+## Consultant round (codex = gpt-5.6-sol; agy = Antigravity)
+Codex: careful and broadly correct; agreed on latency-bound diagnosis; staged
+bounds 20-25 t/s solid / 25-28 very good / 30 excellent / 35+ unlikely. Its novel
+idea is a T-MAC-style **activation-side partial-sum LUT**: per 128-weight block
+split activations into 32 groups of 4, precompute L_g[p] = sum of +-x over the 16
+sign patterns (8 with the L_g[p^15] = -L_g[p] symmetry), then the weight nibble
+indexes the table: y_r += d_r * sum_g L_g[q_rg]. ~16 packed adds per 128 weights
+instead of ~64 packed FMAs, and the scale applies once per block. Needs >=16 rows
+per WG to amortize LUT construction. Also: try PP double-buffering at EQUAL LDS
+footprint (BK=32 x 2 buffers vs BK=64 x 1) — our falsification doubled LDS and lost
+to occupancy, which does not falsify the idea.
+
+agy: more optimistic and partly wrong. Its headline recommendation — pre-format
+sign bits at bit 15/31 of a dword at repack time so the loop is v_xor_b32 +
+v_pk_add_f16 with zero LDS — is UNSOUND: a 32-bit mask covering 2 weights means
+16 bits of storage per weight, a 16x expansion that destroys the 1.125 bpw
+bandwidth advantage. Codex analyzed the same idea and rejected it correctly.
+agy's claimed ceilings (65-70 t/s, 335 GB/s matvec) are not credible.
+
+Full transcripts: scratchpad/codex-consult.out, scratchpad/agy-consult.out.
+Brief (updated to current state): scratchpad/consult-brief.md.
+
+## Ranked remaining work
+1. Matvec memory-level parallelism (prefetch variant built; then multiple partial
+   accumulators per row, and per-shape rows/WG selection).
+2. T-MAC activation-side LUT matvec at 16-32 rows/WG.
+3. GDN prologue fusion — but ONLY the links actually on the dependent chain
+   (sigmoid/softplus/add/mul on alpha+beta, L2_NORM pair). Re-estimate honestly:
+   the GET_ROWS result shows adjacency does not imply removable cost.
+4. Merge the alpha+beta projections (m=48 each, 96 dispatches, 2.29 ms at 20 GFLOPS).
+5. PP: equal-LDS double buffering (BK=32 x2).
+
+## Round-4 results (verified, 2026-07-31)
+
+Two code changes + one hardware finding took TG 18.67 -> 21.67 and pp512 141 -> 160.5.
+
+| change | TG | pp512 | notes |
+|---|---|---|---|
+| session start (v11.3) | 18.67 | 141.1 | at 950 MHz core (unknown at the time) |
+| + snapshot-free K=1 GDN rows | 18.66 | - | bit-identical; GET_ROWS 97->49 ops; only +0.37 ms wall (off critical path) |
+| + matvec prefetch (widelutpf) | 19.48 | - | +4.1%, bit-identical, `GGML_VK_TERNARY_PREFETCH=1` |
+| + core clock 950 -> 1138 MHz | 21.71 | 145.0 | +11% TG, +22% PP; free |
+| + TILE_M warptile | 21.67 | 160.5 | best combined config |
+
+Production env (all knobs):
+```
+GGML_VK_TERNARY_ROWS=8 GGML_VK_GCN_SUBGROUP_REDUCE=1 GGML_VK_TERNARY_SOA=1 \
+GGML_VK_TERNARY_LUT=1 GGML_VK_TERNARY_PREFETCH=1 GGML_VK_MM_PACKED=1 \
+GGML_VK_TILE_M=256,128,64,32,32,64,2,4,4,1,64
+```
+Runtime store: /nix/store/axc7pdxpxjr010a6w5i8jja3n0b2x09z-vega-runtime
+
+### GPU clock ceiling (see memory: vega-gpu-clocks-underclocked)
+The cards were pinned to 950 MHz by a HiveOS mining profile (not 1474 stock boost), so
+every roofline in rounds 1-3 was computed against the wrong clock. 1138 MHz is the hard
+stable ceiling: 1269 MHz hangs at both 800 and 950 mV, 1312 hangs, and `auto` (which
+boosts to 1590 at 30 C) also produced ring timeouts. A hang needs a full reboot -- it
+leaves unkillable D-state processes and wedged TTM kworkers that make all later
+benchmarks silently worthless. Three reboots were needed this session.
+
+### Still open
+1. Matvec is latency-bound at ~102 GB/s of a 410 GB/s roofline and is 74% of the token.
+   This remains the only path to 30 t/s. Next: multiple partial accumulators per row,
+   cross-iteration software pipelining, per-shape rows/WG.
+2. T-MAC activation-side LUT (codex's design, see above) at 16-32 rows/WG.
+3. GDN prologue fusion -- but size it off the critical path, not perf-logger totals.
+4. PP: equal-LDS double buffering (BK=32 x2); re-scan TILE_M at 1138 MHz since the
+   compute/memory balance moved.
