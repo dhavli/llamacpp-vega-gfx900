@@ -471,3 +471,42 @@ Ranked next experiments (all cheap, all env/shader-local):
    may now win even though the pre-SoA ALU variant lost at 950 MHz. Re-test at 1590 MHz.
 3. A LUT in SGPRs instead of LDS is not viable: dynamic indexing of an SGPR table needs
    a permute, which uses the same LDS/DS pipe.
+
+### Round-4g: both occupancy and LDS->ALU are REFUTED (measured at 1590 MHz)
+
+**Occupancy is NOT the constraint.** Dumped ISA for both variants:
+
+| variant | max VGPR | waves/SIMD | lgkm waits per ds_read | TG |
+|---|---|---|---|---|
+| LUT, no prefetch | 47 | **5** | 1.10 | 24.57 |
+| LUT + prefetch | 63 | 4 | **0.87** | **26.01** |
+
+The *lower*-occupancy variant is 6% FASTER. So llama.cpp issue #20848's VGPR->occupancy
+pathology does not transfer to this kernel, and a VGPR diet would likely regress. What
+tracks performance is **LDS waits per unit work**, not waves/SIMD. (ACO also unrolls the
+prefetch variant 1.5x more: 14318 vs 10485 ISA instructions, same ds_read/pk_fma ratio.)
+
+**Trading LDS for VALU is NOT a win either**, even though we are LDS-stall-bound with only
+~18% VALU utilization:
+
+| variant at 1590 MHz | TG |
+|---|---|
+| LUT + prefetch | 26.01 / 25.92 |
+| LUT, no prefetch | 24.57 |
+| pure ALU, no LUT (widesoa) | 21.42 / 21.73 |
+
+Pure ALU is 20% SLOWER. So the LDS LUT is a real local optimum: removing LDS costs more in
+added VALU than it saves in stalls. Both ranked experiments from round-4f are dead.
+(Also: prefetch is worth +5.7% at 1590 MHz, up from +4% at 950 MHz.)
+
+### The one idea still supported by the evidence: a byte-indexed LUT
+If LDS *stalls* dominate but LDS is still the cheapest way to expand signs, then reduce the
+number of LDS operations per weight rather than eliminate them. Current: one `ds_read_b64`
+per **nibble** = per 4 weights. Proposed `TERNARY_LUT8`: index by a **byte** into
+`shared f16vec4 ter_lut8[256][2]` (256 x 16 B = 4 KB LDS, fine against 64 KB/CU), giving
+8 weights per lookup -> **halves ds_read count and lgkmcnt wait points per weight**.
+Two adjacent f16vec4 are 16 contiguous bytes so ACO can emit one `ds_read_b128`.
+Build cost: 256 entries instead of 16, initialized once per workgroup (64 threads x 4
+entries each) and amortized over the whole row block.
+Risk to watch: bank conflicts. 16 B per entry = 4 banks, so entries 8 apart collide;
+with 64 lanes reading unrelated bytes this could serialize. Must be measured, not assumed.
