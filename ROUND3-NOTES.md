@@ -353,3 +353,60 @@ physically impossible (needs ~54 TFLOPS; the part does ~18 TFLOPS fp16 at 1590 M
 All 7 (b, ub) combinations gave TG 21.39-21.65 at 1138 MHz with identical md5 — a 1.2%
 spread, i.e. noise. Expected: decode is n==1, so the micro-batch size cannot change the
 mat-vec. Do not tune -b/-ub for decode.
+
+## Round-4e: multi-GPU unlocked, and Vega 64 BIOS characterized
+
+### Why only one GPU was ever visible
+`ggml_vk_instance_init` **deduplicates physical devices by `deviceUUID`** (the RADV+AMDVLK
+dedup from llama.cpp PR #7582). RADV reports the SAME deviceUUID for all the identical Vega
+cards in this rig, so 6 GPUs collapsed to 1 and `--list-devices` showed one device.
+**`GGML_VK_VISIBLE_DEVICES=N` takes a separate code path that skips dedup entirely**, so it
+is the way to reach the other cards. Indices 0..5 are valid (6 of 7 cards bind; see below).
+
+Verified mapping (by polling `mem_info_vram_used` during decode): `VISIBLE=N -> card(N+1)`,
+i.e. PCI bus order. 0->03:00.0, 1->0a, 2->0d, 3->10, 4->13, 5->16.
+
+### One card does not POST
+`0000:07:00.0` fails: `atom_op_jump: atombios stuck in loop for more than 20secs`,
+`gpu post error!`, `Fatal error during GPU init`, `probe of 0000:07:00.0 failed with -22`.
+Confirmed by the user to be a bad VBIOS flash; being flashed back. Only 6 GPUs usable.
+
+### Per-card VBIOS / clock tables differ a LOT
+| card | pci | vbios | top sclk | top mclk | pcap max |
+|---|---|---|---|---|---|
+| 1 | 03 | 111 | 1590 | 800 | 277 W |
+| 2 | 0a | 111 | 1590 | 800 | 277 W |
+| 3 | 0d | 115-D050PIL-100 | 1590 | 800 | 390 W |
+| 4 | 10 | 115-D050PIL-100 | 1590 | 800 | 390 W |
+| 5 | 13 | xxx-xxx-xxx | 1622 | ? | 247 W |
+| 6 | 16 | 113-D0500500-102 | **1750** | **945** | 396 W |
+
+Only card6 has a real Vega 64 table (higher sclk AND 945 MHz HBM). Cards 3/4's flash only
+raised the power ceiling; clocks/voltages are byte-identical to stock.
+
+### Stock vs Vega 64 BIOS, each at its own max (sustained clocks measured via hwmon freq1_input)
+| | card1 stock | card6 V64 | delta |
+|---|---|---|---|
+| requested / sustained sclk | 1590 / **1628** MHz | 1750 / **1817** MHz | +11.6% |
+| mclk | 800 | 945 | +18% |
+| pp512 | 199.6 | **225.9** | **+13.2%** |
+| prompt eval, 65 tok | 87.9 | **101.5** | +15.5% |
+| TG | **26.06** | 24.85 | -4.6% |
+
+**Prefill scales with core clock** (+11.6% clock -> +9.9..13% PP): real, well outside noise.
+**Decode does not benefit from either more core clock or more bandwidth**, which is further
+evidence it is latency-bound (a higher mclk raises bandwidth but not latency, and looser
+timings can raise absolute latency).
+
+CAVEAT on the -4.6% decode delta: it is INSIDE the per-card spread. At an identical forced
+1590 MHz, the six cards gave TG 25.42 / 23.85 / 22.83 / 22.56 / 23.73 / 24.63 -- a 13%
+spread across nominally identical hardware. So do NOT attribute card6's slightly lower
+decode to the BIOS; it is not separable from silicon/board variance. The prefill gain is
+large enough to be real.
+
+**Practical: use card6 (VISIBLE=5) for prefill-heavy work (pp512 226), card1 (VISIBLE=0)
+for decode-heavy work (TG 26.1).** Note `pp_dpm_mclk` writes are accepted but ignored on
+card6 (it will not leave 945 MHz), so the mclk-latency hypothesis could not be tested
+directly.
+
+Best numbers this session: **TG 26.06 (card1) / pp512 225.90 (card6)**, from 18.67 / 141.1.
