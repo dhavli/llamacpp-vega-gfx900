@@ -1,4 +1,4 @@
-From 53b9b5436410e6fe43c01d477bb10919a97861af Mon Sep 17 00:00:00 2001
+From f487ee0f68772d9f927e6e1050007f0f48992124 Mon Sep 17 00:00:00 2001
 From: Donach's Bot <bot@braiins.cz>
 Date: Thu, 30 Jul 2026 19:09:57 +0200
 Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
@@ -18,7 +18,7 @@ Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
 - GGML_VK_TILE_{L,M,S}: runtime warptile override (11 csv uints) for the
   dequant mmq pipelines, wg_denoms follow BM/BN.
 ---
- ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 425 +++++++++++++++++-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 438 +++++++++++++++++-
  .../vulkan-shaders/dequant_funcs.glsl         |  32 ++
  .../vulkan-shaders/gated_delta_net.comp       |   9 +
  .../vulkan-shaders/mul_mat_vec.comp           | 181 +++++++-
@@ -29,12 +29,13 @@ Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
  .../src/ggml-vulkan/vulkan-shaders/types.glsl |  18 +
  .../vulkan-shaders/vulkan-shaders-gen.cpp     | 106 +++++
  src/llama-context.cpp                         |   5 +
+ src/models/delta-net-base.cpp                 |   4 +
  src/models/qwen35.cpp                         |   6 +-
- 12 files changed, 1015 insertions(+), 124 deletions(-)
+ 13 files changed, 1032 insertions(+), 124 deletions(-)
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/sigglu.comp
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index fd22aba..616851e 100644
+index fd22aba..2feeca6 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -751,6 +751,9 @@ struct vk_device_struct {
@@ -679,7 +680,28 @@ index fd22aba..616851e 100644
              } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                  ctx->num_additional_fused_ops = 2;
                  fusion_string = "SSM_CONV_BIAS_SILU";
-@@ -16890,8 +17272,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -16419,7 +16801,20 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const
+     return ggml_backend_vk_init(ctx->device);
+ }
+ 
++static bool ggml_backend_vk_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op);
++
+ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    const bool ok = ggml_backend_vk_device_supports_op_impl(dev, op);
++    if (!ok && getenv("GGML_VK_SOA_DEBUG") != nullptr) {
++        fprintf(stderr, "vk rejects op %s (%s) src0=%s src6=%s\n",
++            ggml_op_name(op->op), op->name,
++            op->src[0] ? ggml_type_name(op->src[0]->type) : "-",
++            op->src[6] ? ggml_type_name(op->src[6]->type) : "-");
++    }
++    return ok;
++}
++
++static bool ggml_backend_vk_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     const vk_device& device = ggml_vk_get_device(ctx->device);
+ 
+@@ -16890,8 +17285,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
              return true; // all inputs are contiguous, see ggml.c
          case GGML_OP_GATED_DELTA_NET:
              {
@@ -1936,6 +1958,21 @@ index 5f43818..94421de 100644
      if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
          LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
                          __func__, cparams.n_rs_seq);
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index e65f55b..582c435 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -521,6 +521,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+                 conv_input->nb[1], conv_input->nb[2],
+                 ggml_row_size(conv_input->type, s_idx0));
+ 
++        // some backends (Vulkan) require a contiguous im2col input; the tail
++        // view is strided, and this tensor is tiny
++        tail = ggml_cont(ctx0, tail);
++
+         // im2col reads only the shape of its kernel argument
+         ggml_tensor * kshape = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, conv_kernel_size - 1, conv_channels);
+ 
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
 index 195062d..bfaebd4 100644
 --- a/src/models/qwen35.cpp
