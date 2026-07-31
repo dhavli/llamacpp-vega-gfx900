@@ -410,3 +410,64 @@ card6 (it will not leave 945 MHz), so the mclk-latency hypothesis could not be t
 directly.
 
 Best numbers this session: **TG 26.06 (card1) / pp512 225.90 (card6)**, from 18.67 / 141.1.
+
+## Round-4f: ISA evidence — the matvec is LDS-latency + occupancy bound, NOT HBM-latency bound
+
+Got the real disassembly at last: `RADV_DEBUG=shaders` (NOT `shaderstats`, which prints
+nothing on this build). 6.8 MB dump; our LUT matvec is the block with 14318 ISA
+instructions. **Parsing caveat:** the dump interleaves RADV's backend IR
+(`%374:v[14] = v_pk_fma_f16 ...`) with final ISA (which always has a `; hexcode`
+suffix). Counting IR lines as ISA gives nonsense (max VGPR 4, 4 s_waitcnt). Filter to
+lines containing `;`.
+
+### Measured, block 4 (mul_mat_vec q1_0 SoA+LUT+prefetch, f16 B)
+| metric | value |
+|---|---|
+| ISA instructions | 14318 |
+| `ds_read_b64` (LUT reads) | 1344 |
+| `v_pk_fma_f16` | 2352 |
+| `buffer_load_dwordx4` | 112 |
+| `buffer_load_dword` | 168 |
+| `buffer_load_short_d16` (f16 scales) | 166 |
+| **max VGPR** | **63** |
+| max SGPR | 36 |
+
+### s_waitcnt by counter type — LDS dominates 5:1
+| wait | count |
+|---|---|
+| lgkmcnt(*) i.e. LDS | **~1167** |
+| vmcnt(*) i.e. VMEM | ~230 |
+
+ACO *is* software-pipelining the LDS reads (waits at lgkmcnt(2), (5), (6), (7), not just
+(0)), so this is not naive codegen. But LDS wait points outnumber memory wait points 5:1.
+
+### Consequences — two prior conclusions are now wrong
+1. **"HBM-latency bound" was too coarse.** The dominant stall source is the LDS pipe from
+   the 16-entry sign LUT, not HBM. That is why decode gained nothing from card6's +18%
+   memory bandwidth while prefill gained +13% from core clock.
+2. **The T-MAC activation-side LUT (codex's top pick) is now a BAD bet for us.** It replaces
+   FMAs with *more* LDS lookups, and LDS latency is already the bottleneck. Deprioritized.
+   (agy called T-MAC-on-GPU a dead end; its stated reason was wrong but the conclusion
+   happens to match this evidence.)
+3. `buffer_load_dwordx4` is already used for the bulk loads, so llama.cpp issue #20846's
+   scalar-load pathology does NOT apply to our kernel.
+
+### The actionable lever: VGPR 63 -> occupancy
+Waves/SIMD = floor(256 / VGPRs) on wave64: **63 VGPRs = 4 waves/SIMD (40% occupancy)** —
+exactly the pathology in llama.cpp issue #20848 (64 VGPR / 4 waves / ~208 GB/s vs
+40 VGPR / 6 waves / 229 GB/s on the same gfx900 silicon, MI25).
+Thresholds: <=51 VGPR -> 5 waves, <=42 -> 6 waves, <=36 -> 7 waves.
+
+Note our own `GGML_VK_TERNARY_PREFETCH` made this worse: `pbits[NUM_ROWS]` +
+`pd[NUM_ROWS]` at NUM_ROWS=8 is ~16 extra VGPRs held across the FMA chain. It bought
+memory-level parallelism at the cost of occupancy, which is very likely why it only
+returned +4% instead of the expected large win.
+
+Ranked next experiments (all cheap, all env/shader-local):
+1. Pack the prefetched scales as f16 pairs (`pd` 8 VGPRs -> 4), and/or prefetch only
+   `bits` and load `d` inline, to get under the 51-VGPR line for 5 waves.
+2. Trade LDS back for VALU: we are at only ~18% VALU issue utilization but LDS-bound, so
+   replacing `ds_read_b64` with `bitfieldExtract`-based sign expansion (single `v_bfe_u32`)
+   may now win even though the pre-SoA ALU variant lost at 950 MHz. Re-test at 1590 MHz.
+3. A LUT in SGPRs instead of LDS is not viable: dynamic indexing of an SGPR table needs
+   a permute, which uses the same LDS/DS pipe.
