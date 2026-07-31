@@ -11,7 +11,7 @@ Full ledger: `benchmarks/llm/index.jsonl` (12 records, including invalid/artifac
 
 | | |
 |---|---|
-| Host | `RIG4AMDRX580Vega` (100.95.237.97), HiveOS / Ubuntu 22.04.5, kernel 6.6.0-hiveos |
+| Host | `RIG4AMDRX580Vega`, HiveOS / Ubuntu 22.04.5, kernel 6.6.0-hiveos |
 | GPUs | **7× AMD Radeon RX Vega 56** (gfx900, 8176 MiB each), all PCIe **8GT/s x16** |
 | CPU / RAM | **2 cores** (SSE4.2 tier, no AVX2), **3810 MiB RAM**, no swap initially |
 | Driver | Mesa **23.2.1** RADV (installed `mesa-vulkan-drivers`, `libvulkan1`, `vulkan-tools`) |
@@ -215,7 +215,7 @@ recorded baseline, not a direction.
 
 Single-user Nix 2.35.1 now runs on the rig (nixbld group created; binaries symlinked to
 `/usr/local/bin`; `nix-command flakes` enabled). Deploys are now
-`nix copy --to ssh://root@100.95.237.97 --no-check-sigs ./result-runtime` — hash-verified
+`nix copy --to ssh://root@RIG-HOST --no-check-sigs ./result-runtime` — hash-verified
 and registered, no more silent truncation. The earlier rsync-shipped paths were
 re-registered by the first `nix copy`.
 
