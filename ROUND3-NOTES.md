@@ -293,3 +293,23 @@ micro-batch at ub=512 and therefore literally cannot show this effect):
 `248320 * 2048 * 4` = 2,034,237,440 B = exactly the 2.03 GB allocation in the error.
 This model's 248320-token vocab is unusually large, so each +512 of ub costs 508 MB of
 VRAM. Probed ceiling on 8 GB with 3.53 GiB of weights resident: **ub=1792 fits, 2048 OOMs.**
+
+### -ub optimum is prompt-length dependent and NON-monotonic
+Full `-ub` scan at b=8192 (1138 MHz, `--mmap 0 -r 2`):
+
+| -ub | pp2048 | pp8192 | logits VRAM |
+|---|---|---|---|
+| 512  | 165.2 | 119.8 | 0.51 GB |
+| **1024** | **168.1** | 134.7 | 1.02 GB |
+| 1536 | 166.1 | 131.2 | 1.53 GB |
+| **1792** | 162.5 | **137.9** | 1.78 GB |
+| 2048 | OOM   | OOM   | 2.03 GB |
+
+Note ub=1536 is WORSE than both 1024 and 1792 at pp8192 (131.2 vs 134.7 / 137.9) --
+non-monotonic, so do not assume "bigger ub is better" and interpolate; measure the points.
+Likely a tiling/alignment interaction with the mul_mm tile (BM=128, BN=64).
+
+Recommendation: **ub=1024 as the default** -- best at pp2048, near-best at pp8192, and only
+1 GB of logits buffer. Use **ub=1792 only for workloads dominated by very long prompts**
+(+2.4% at pp8192 but -3.4% at pp2048, and 1.78 GB of VRAM). Leave `-b` at whatever; it does
+nothing.
