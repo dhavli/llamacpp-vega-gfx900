@@ -27,12 +27,20 @@ output md5 verified identical at every step:
 
 | GPUs | pp512 | pp2048 | pp8192 | decode @5.6k ctx |
 |---|---|---|---|---|
-| 3 | **522.1** | **641.5** | **585.1** | (did not fit — see GTT spill below) |
-| 6 | 490.1 | 506.4 | 457.1 | **27.61** |
+| **3** (`-c 8192`) | 521.1 | **641.0** | **584.9** | **30.84** |
+| 4 | 499.2 | 561.2 | 509.9 | (spilled — see below) |
+| 6 | 490.1 | 506.4 | 457.1 | 27.61 |
 
 A sparse 35B at 4-bit beats a hand-tuned dense 27B at 1.125 bpw on **both** axes on this
-hardware — 3–4× the prefill and slightly better decode — because prefill is FLOP-bound and
-MoE simply doesn't ask for the FLOPs these cards can't deliver.
+hardware — 3× the prefill and better decode — because prefill is FLOP-bound and MoE simply
+doesn't ask for the FLOPs these cards can't deliver. On 3 cards a real 5629-token prompt
+prefills at **624 t/s** and then generates at **30.8 t/s**.
+
+Note the direction: MoE prefill gets **worse** with more cards (641 → 561 → 506 at pp2048),
+the opposite of the dense model, which *gained* from 3 cards at long prompts. A3B does roughly
+a ninth of the matmul per token, so per-stage work is small relative to the fixed per-boundary
+copy — sparsity cuts compute but not the number of layer boundaries. Three cards is optimal on
+both axes, as long as the context fits.
 
 ## What's in the patch
 
@@ -101,12 +109,19 @@ half the token time. Fewer cards is better for decode, as long as the model fits
 † the 2.32 t/s figure is under investigation — it is inconsistent with the per-boundary cost
 implied by the 6-GPU point, and was measured while a large download was saturating the host.
 
-**Watch out for GTT spill.** With `-ngl 99` set explicitly, llama.cpp skips its auto-fit step
-(`failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort`)
-and allocates anyway; the kernel then transparently evicts buffers to GTT and every access
-crosses PCIe. Symptom: prefill collapsing from 585 t/s to 9.3 t/s on the same cards. Note that
-`token_embd` and `output.weight` (~540 MB each at Q8_0 with a 248320-token vocab) both land on
-the main device, so the split is not as even as layer counts suggest.
+**Watch out for GTT spill, and don't trust free-VRAM readings to detect it.** With `-ngl 99`
+set explicitly, llama.cpp's auto-fitter gives up (`failed to fit params to free device memory:
+n_gpu_layers already set by user to 99, abort`) and allocation proceeds anyway; the kernel then
+transparently evicts buffers to GTT and every access crosses PCIe. Symptom: prefill collapsing
+from 585 t/s to 9.3 t/s on the same cards, with decode at 1.5 t/s.
+
+The trap is that **an evicted buffer no longer counts as VRAM used**, so `mem_info_vram_used`
+reads *healthier* the worse the spill is. The 3-card config that works (`-c 8192`) sits at
+7041/7034/7219 MiB of 7.98 GiB per card; the 4-card config that spilled reported only
+5.7–5.9 GiB per card and looked like it had 2 GB spare. Judge fit by whether throughput matches
+`llama-bench` on the same devices, not by reported free memory. Also note `token_embd` and
+`output.weight` (~540 MB each at Q8_0 with a 248320-token vocab) both land on the main device,
+so the split is less even than layer counts suggest.
 
 ## Falsified — measured, don't repeat
 
