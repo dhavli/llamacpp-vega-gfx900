@@ -313,3 +313,43 @@ Recommendation: **ub=1024 as the default** -- best at pp2048, near-best at pp819
 1 GB of logits buffer. Use **ub=1792 only for workloads dominated by very long prompts**
 (+2.4% at pp8192 but -3.4% at pp2048, and 1.78 GB of VRAM). Leave `-b` at whatever; it does
 nothing.
+
+## Round-4d: the clock ceiling was an undervolt artifact — 1590 MHz is stable
+
+After the mining OC was cleared, the card's real stock V/F table became visible
+(1138@950mV, 1269@1000, 1312@1050, 1474@1100, 1538@1150, 1590@1200mV). The mining
+profile had pinned EVERY state to a flat 800 mV, which is why 1269/1312 hung earlier
+and why "raising" 1269 to 900/950 mV did not help — still under the 1000 mV it needs.
+**The earlier "1138 MHz is a hard ceiling / the card is degraded" conclusion was wrong.**
+
+Clock ladder at stock voltages (all md5-identical, rings=0, fail-fast never triggered):
+
+| DPM state | clock | TG | temp |
+|---|---|---|---|
+| 2 | 1138 MHz | 21.56 | 30 C |
+| 3 | 1269 MHz | 22.75 | 36 C |
+| 4 | 1312 MHz | 23.01 | 37 C |
+| 5 | 1474 MHz | 24.62 | 38 C |
+| 6 | 1538 MHz | 25.49 | 39 C |
+| 7 | **1590 MHz** | **25.87** | 41 C |
+
+Full verified bench at 1590 MHz (state 7, power cap 250 W, best env + TILE_M BK=64):
+
+| metric | value |
+|---|---|
+| TG (decode, -n 128) | **26.06 t/s** |
+| pp512 | **199.55** |
+| pp2048 (ub=1024) | 197.03 |
+| pp8192 (ub=1024) | 156.38 |
+| prompt eval, 65 tok | 87.89 |
+| md5 | 19d4d2c0f65e (unchanged) |
+| temp | 43 C |
+
+Session arc: TG 18.67 -> 26.06 (+40%), pp512 141 -> 199.6 (+41%).
+Against the /goal (TG 30, PP 1000): TG is now within 13% of target. PP 1000 remains
+physically impossible (needs ~54 TFLOPS; the part does ~18 TFLOPS fp16 at 1590 MHz).
+
+### TG is NOT affected by -b or -ub (measured)
+All 7 (b, ub) combinations gave TG 21.39-21.65 at 1138 MHz with identical md5 — a 1.2%
+spread, i.e. noise. Expected: decode is n==1, so the micro-batch size cannot change the
+mat-vec. Do not tune -b/-ub for decode.
