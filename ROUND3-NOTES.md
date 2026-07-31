@@ -258,3 +258,38 @@ gives +-0.1. Use the latter for any comparison under ~5%.
 Also: the ab-bench md5 captures stderr, so runs with a TILE_M banner have a different
 md5 than runs without. Decode correctness is pinned by the banner-free run (9e30dd54e452);
 TILE_M only affects mul_mm (prefill), not the n==1 matvec.
+
+## Round-4c: -b / -ub (batch / micro-batch) sweep
+
+**`-b` (logical batch) has ZERO effect on throughput. `-ub` (micro-batch) is the only knob
+that matters.** `-b` only controls how many tokens are handed to llama_decode before being
+split into `-ub` chunks, so it changes bookkeeping, not GEMM shapes.
+
+Measured (1138 MHz, best env, `--mmap 0 -r 2`, so +-0.05):
+
+| -b | ub=512 pp2048 | ub=512 pp8192 | ub=1024 pp2048 | ub=1024 pp8192 |
+|---|---|---|---|---|
+| 512  | 165.08 | 119.75 | - | - |
+| 1024 | 165.14 | 119.82 | 168.14 | 134.74 |
+| 2048 | 165.26 | 119.85 | 168.18 | 134.76 |
+| 4096 | 165.22 | 119.83 | 168.08 | 134.81 |
+| 8192 | 165.23 | 119.81 | 168.14 | 134.80 |
+
+Spread across a 16x range of -b is 0.1%, i.e. noise. Don't bother tuning it.
+
+`-ub` scaling (the win only appears on LONG prompts -- our pp512 benchmark is a single
+micro-batch at ub=512 and therefore literally cannot show this effect):
+
+| prompt | ub=512 | ub=1024 | delta |
+|---|---|---|---|
+| pp512  | 168.4 | 168.7 | - |
+| pp1024 | 167.7 | 170.7 | +1.8% |
+| pp2048 | 165.3 | 168.1 | +1.7% |
+| pp4096 | 159.9 | 162.8 | +1.8% |
+| pp8192 | 119.8 | 134.8 | **+12.5%** |
+
+### -ub is VRAM-capped, not performance-capped
+`-ub 2048` fails to allocate: the logits buffer is `n_vocab * ub * 4 B` =
+`248320 * 2048 * 4` = 2,034,237,440 B = exactly the 2.03 GB allocation in the error.
+This model's 248320-token vocab is unusually large, so each +512 of ub costs 508 MB of
+VRAM. Probed ceiling on 8 GB with 3.53 GiB of weights resident: **ub=1792 fits, 2048 OOMs.**
