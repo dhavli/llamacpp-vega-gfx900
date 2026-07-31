@@ -63,3 +63,25 @@ Brief ready: session scratchpad `consult-brief.md` (also usable standalone). `co
 fp16 staging alone; occupancy alone; SoA coalescing alone (matvec is ALU-bound);
 LOAD_VEC_A=16 load_a; BK_STEP=4 V4 LDS loads; TERNARY_BS 128/256; TERNARY_ROWS ≠ 8;
 mm tiles: BK≠32, TM/TN=8, tiles >128×128, BN>64 with packed-k accumulators.
+
+## GDN rows-mode Vulkan port (in progress 2026-07-31 ~05:00)
+DISCOVERY: the state fusion already exists as `ggml_gated_delta_net_rows` (ggml.h:2565) —
+reads per-seq state from the 2D cache view at rows[seq]; kills per-layer gather + slot-0 cpy.
+Implemented on CPU (+Metal); Vulkan rejects src[6] in supports_op (ggml-vulkan.cpp:~17234)
+and qwen35.cpp (~line 470) additionally requires all-GPU-devices==Metal to emit it.
+CPU reference (ggml-cpu/ops.cpp:~10565): ONLY input addressing differs:
+  s_in = state_base + rows[seq]*(state.nb[1]/4) + head*S_v*S_v   (vs seq*K*H*D + head*D)
+Output layout unchanged (attn | K snapshot slots).
+Vulkan port pieces:
+1. Shader gated_delta_net.comp: `#if GDN_ROWS` → binding 7 = I32 rows[]; push const
+   `state_row_stride`; state_in_base = rows[seq_id]*state_row_stride + head_id*state_size.
+   (state_in_base currently `(seq_id*K*H + head_id)*state_size`, rel line ~107.)
+2. In rows mode K = n_snap_slots comes from op_params (VERIFY in ggml.c ctor), NOT
+   src_state->ne[1] (that's the cache row count) — fix host dispatch K computation.
+3. Pipelines: mirror pipeline_gated_delta_net[3][2] (created ggml-vulkan.cpp:5351, selected
+   :10683) as _rows variant, 8 bindings, gen-emitted with {"GDN_ROWS","1"}.
+4. Dispatch ggml_vk_gated_delta_net (~11552): if src[6]: rows pipeline, bind rows buf,
+   pass state_row_stride = src_state->nb[1]/4.
+5. supports_op: accept src[6] type I32.
+6. qwen35.cpp device check: accept reg_name "Vulkan" too.
+Validate: GGML_GDN_STATE_GATHER=1 (legacy) vs rows-mode A/B, md5 + ab-bench.
