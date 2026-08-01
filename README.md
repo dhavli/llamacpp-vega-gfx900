@@ -5,8 +5,9 @@ via llama.cpp's **Vulkan** backend (Mesa RADV + ACO) — hardware with excellent
 and no modern matrix hardware at all: **no dp4a, no int8 dot, no matrix cores, no coopmat**, and
 `v_fma_f16` at fp32 rate unless you get ACO to emit the *packed* `v_pk_fma_f16`.
 
-Test rig: 6× Vega 56/64 (8 GB HBM2 each) on a 2-core Celeron with **3.8 GB of system RAM**,
-HiveOS. Everything below was measured on that machine.
+Test rig: 7× Vega 56/64 (8 GB HBM2 each) on a 2-core Celeron with **3.8 GB of system RAM**,
+HiveOS, every card on a mining riser at **PCIe Gen2 x1 (~0.5 GB/s)**. Everything below was
+measured on that machine.
 
 ## Headline results
 
@@ -154,6 +155,17 @@ reads *healthier* the worse the spill is. The 3-card config that works (`-c 8192
 `llama-bench` on the same devices, not by reported free memory. Also note `token_embd` and
 `output.weight` (~540 MB each at Q8_0 with a 248320-token vocab) both land on the main device,
 so the split is less even than layer counts suggest.
+
+**Don't trust sysfs/lspci link speed on Vega — read the bridge, not the GPU.** Vega 10 puts a
+two-level PCIe bridge on the package, and both the GPU function's `lspci -vv LnkSta` and
+amdgpu's `current_link_speed`/`current_link_width` report the *on-die* hop — a very healthy
+"8 GT/s x16" — regardless of how the card is actually connected. The real host-facing link is
+the outermost bridge (`01:00.0`-style) to its root port, and `pp_dpm_pcie` tells the truth: on
+this rig every card offers exactly one state, `5.0GT/s, x1` — Gen2 x1 risers, ~0.5 GB/s each
+way, even for the card in the CPU's x16 slot. That's fine for layer-split *decode* (the hidden
+state is ~4 KB/token/boundary; latency dominates, not bandwidth) but each prefill ubatch moves
+megabytes per boundary through host RAM, which is part of why MoE prefill decays monotonically
+with card count.
 
 ## Falsified — measured, don't repeat
 
