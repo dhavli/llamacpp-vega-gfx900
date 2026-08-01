@@ -167,7 +167,16 @@ state is ~4 KB/token/boundary; latency dominates, not bandwidth) but each prefil
 megabytes per boundary through host RAM, which is part of why MoE prefill decays monotonically
 with card count.
 
-## Falsified — measured, don't repeat
+**Serving topology: fewer cards per instance wins, and host RAM is the real wall.** At an
+identical serving load (4 slots × 128k, q8_0 KV, 8k prompts) 4 cards beat 6 cards on both axes:
+prefill 471 vs 425 t/s, aggregate decode 52.2 vs 48.6 — two fewer layer boundaries is worth
+more than two extra GPUs. But capacity is card-bound (8×128k needs ~32.3 GB and does *not* fit
+4×7.98 GB), and running **two instances on disjoint cards** — the only way to scale aggregate
+prefill, since slots share one compute budget — is blocked by host RAM on a 3.8 GB box: every
+attempt was OOM-killed, **and zram does not help**. The killed processes held ~150 KB of anon
+RSS; the pressure is pinned GTT pages (Vulkan host-visible staging), which swap cannot touch.
+Budget real RAM for `n_instances × ~2.75 GB` plus page cache, or benchmarks spend ~80% of
+wall-clock re-reading the model from disk.
 
 The matvec is a well-established local optimum. All of these were built and measured, at
 1590 MHz, and lost:
