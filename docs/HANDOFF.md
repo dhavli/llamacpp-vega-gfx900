@@ -149,9 +149,12 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    matvec instead of layer-serializing. Upstream tracking issue
    github.com/ggml-org/llama.cpp/issues/22648 — segfaults + missing get_tensor_2d as of
    May 2026. Check monthly; do NOT try to build it ourselves yet.
-9. **ACO-level micro-experiments** (Bonsai kernels): `ACO_DEBUG=nosched` A/B; LDS row-stride
-   padding to odd to dodge bank conflicts; ensure `f16vec2` (not scalar float16_t) in hot
-   loops so ACO emits `v_pk_fma_f16`. Cheap to test, small expected wins.
+9. **ACO-level micro-experiments: RESOLVED, NO WIN.** On the same current closure and full
+   Bonsai production env, `ACO_DEBUG=nosched` regresses pp512 179.02 -> 150.84 (-15.7%) and
+   pp2048 134.01 -> 115.02 (-14.2%). Do not disable ACO scheduling. The proposed odd LDS
+   row stride is already upstream: non-coopmat `SHMEM_STRIDE` is `BK / 2 + 1`, including the
+   packed/double-buffer path. The hot packed loops already use `f16vec2`, and retained ISA
+   evidence counts 2,352 `v_pk_fma_f16` instructions. There is no missing micro-knob here.
 10. **Classic speculative decode with a tiny draft** (e.g. Qwen 0.5B fully on device 0):
     MTP died on per-step D2H embedding copies; a self-contained draft model avoids those but
     still pays per-step logits sync — expect marginal at best on x1; only try if bored.
