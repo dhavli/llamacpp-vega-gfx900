@@ -386,3 +386,20 @@ unchanged 950 mV field (`m 3 <MHz> 950`), and committing the table silently rese
 selection. The checker therefore re-pins SCLK state 7 and MCLK state 3 after every commit,
 including its cleanup back to 800 MHz. The first run without that re-pin produced an invalid
 apparent regression (30.13 → 17.51 t/s at core state 0); it is excluded from the result.
+
+The next HBM step, 950 MHz, was byte-identical but did not clear noise: 32.43 t/s versus a
+fresh 800 MHz baseline of 32.75 t/s (prompt 126.78 versus 124.64). Keep 900 MHz as the best
+proven point.
+
+A separate core-only check held HBM at 800 MHz and changed cards 1–3 from stock
+1590/1200 mV to 1700/1200 mV. It was stable, produced byte-identical output, and raised the
+short 30-token prompt rate from 123.73 to 130.30 t/s (+5.3%), but decode was flat/slightly
+lower at 33.55 versus 33.82 t/s. This is evidence to test long-prompt prefill, not sufficient
+evidence to deploy the core overclock. The cards advertise 1200 mV as their maximum; 1250 mV
+is outside the driver's OD range and was not attempted.
+
+The production-sized prefill gate then falsified that short-prompt signal. At 1590 MHz,
+pp2048 was 578.09 ± 1.44 and pp8192 was 524.39 ± 2.51. At 1700 MHz they were 583.70 ± 2.15
+(+1.0%) and 527.82 ± 3.43 (+0.7%), respectively—inside variance and far below the 6.9% clock
+increase. Combined with flat decode, 1700 MHz adds power without useful Qwen throughput and
+should not be deployed.

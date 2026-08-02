@@ -11,17 +11,10 @@ measured on that machine.
 
 ## Headline results
 
-**Bonsai-27B at Q1_0** (1-bit weights, 1.125 bpw, 3.53 GiB) — hybrid linear attention,
-48 gated-delta-net + 16 full-attention layers. Single Vega 56, deterministic greedy decode,
-output md5 verified identical at every step:
-
-| | decode (t/s) | prefill pp512 (t/s) |
-|---|---|---|
-| Stock prebuilt binary, distro Mesa 23.2 | 13.14 | 92.3 |
-| + nixpkgs Mesa 26.1 RADV (no code change) | 13.81 | 98.9 |
-| + this repo's kernels | 18.67 | 141.1 |
-| + core clock un-pinned from the mining profile (1590 MHz) | **26.06** | **206.4** |
-| Vega 64 BIOS card, 1750 MHz core / 945 MHz HBM | 24.85 | **225.9** |
+> **Current project direction:** production work targets sparse MoE models only, beginning
+> with Qwen3.6-35B-A3B. The Bonsai Q1_0 work is retained as an experiment ledger, but its
+> prefill ceiling is not usable for this deployment and it is no longer an active hosting or
+> optimization target.
 
 **Qwen3.6-35B-A3B at UD-Q4_K_XL** (21.27 GiB, 256 experts / top-8, 3B active,
 30 gated-delta-net + 10 full-attention layers), split across multiple cards:
@@ -36,6 +29,19 @@ A sparse 35B at 4-bit beats a hand-tuned dense 27B at 1.125 bpw on **both** axes
 hardware — 3× the prefill and better decode — because prefill is FLOP-bound and MoE simply
 doesn't ask for the FLOPs these cards can't deliver. On 3 cards a real 5629-token prompt
 prefills at **624 t/s** and then generates at **30.8 t/s**.
+
+Controlled clock experiments on cards 1–3 found that 900 MHz HBM raises deterministic
+decode from 30.93 to **33.18 t/s** (+7.3%) with byte-identical output. 950 MHz did not improve
+on that result. A 1700 MHz / 1200 mV core clock is stable and byte-identical but not useful:
+decode changed 33.82 → 33.55 t/s, pp2048 578.09 → 583.70 (+1.0%), and pp8192 524.39 →
+527.82 (+0.7%). Keep the stock core clock; 900 MHz HBM is the only proven clock win.
+
+### Archived Bonsai result
+
+**Bonsai-27B at Q1_0** reached 26.06 t/s decode and 206.4 t/s pp512 on a Vega 56, or
+225.9 t/s pp512 on the Vega 64 BIOS card. The conventional packed-f16 prefill path is
+roofline-limited to roughly 359 t/s even at impossible 100% peak, so it cannot meet the
+serving floor. Its detailed measurements remain in `RESULTS.md`.
 
 The best safe single-stream runtime knob found so far is
 `GGML_VK_ALLOW_GRAPHICS_QUEUE=1`: on four cards it raises decode from **29.44 to 34.87 t/s**

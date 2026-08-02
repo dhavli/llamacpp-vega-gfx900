@@ -13,8 +13,9 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   acceptable as *combined* throughput across pods.
 - **No CPU inference ever. Minimal host RAM.** The rig gets a 16 GB RAM upgrade (currently
   3.8 GB — this is the wall for anything two-process, see "Confirmed results").
-- Older standing goal (still alive, deprioritized): 1000 PP + 30 TG on a **single** Vega
-  with Bonsai-27B Q1_0. Best so far: 226 PP / 26 TG — prefill is the unsolved half.
+- **Bonsai is retired as a hosting target.** Its measurements and kernels stay as an archive,
+  but do not spend more benchmark or implementation time on it. Optimize sparse MoE serving,
+  currently Qwen3.6-35B-A3B, exclusively.
 - Keep publishing everything to GitHub (`dhavli/llamacpp-vega-gfx900`, branch
   `bench/vega-bonsai-baseline`). Commit style: see `git log`.
 
@@ -31,9 +32,14 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   rate-limited), `nix build .#vega-runtime -o result-runtime`, ship with
   `nix copy --to ssh://root@100.95.237.97 --no-check-sigs ./result-runtime`.
   Patches in `patches/*.patch` auto-apply; 0001 carries ALL kernel work + env knobs.
-- Clocks: a reboot reverts to the 950 MHz mining profile. Reapply:
+- Clocks: a reboot reverts to the mining profile. Reapply:
   `for i in 1..7: echo manual > /sys/class/drm/card$i/device/power_dpm_force_performance_level; echo 7 > pp_dpm_sclk`.
   Cards 6/7 top at 1622/1750 (different BIOS tables) — fine.
+  The rig now boots with `amdgpu.ppfeaturemask=0xffffffff`. On cards 1–3, 900 MHz HBM is a
+  proven +7.3% decode win; 950 MHz is neutral/slightly worse. Core 1700 MHz at the maximum
+  advertised 1200 mV is stable and byte-identical but falsified for throughput: decode is
+  flat, pp2048 gains 1.0%, and pp8192 gains 0.7%, all noise. Keep the stock core clock. Never
+  try 1250 mV: `OD_RANGE` ends at 1200.
 - The user's `coldcard-finder` job may auto-start and take all GPUs; never kill it —
   poll for it to exit before benchmarking (see any `par*.sh` for the guard pattern).
 
