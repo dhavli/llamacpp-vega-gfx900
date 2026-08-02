@@ -107,13 +107,16 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
   Next serving gate is the post-16GB two-pod run with one admitted request per pod.
 
 ### Untried — ordered by expected value/effort (from the research pass + local analysis)
-1. **HBM2 memory clock + timing straps** (decode lever, mining-proven on these exact cards):
-   `amdgpu.ppfeaturemask=0xffffffff` kernel arg, then `echo "m 3 1020" > pp_od_clk_voltage`
-   (Vega 56 stock 800; Samsung dies do 1020-1100 — check die vendor via `amdmemtweak --current`;
-   Hynix: stay ≤945) and Eliovp `amdmemtweak` straps (full Samsung strap set in ledger notes /
-   research report). Our Q1_0 matvec is HBM-LATENCY-bound (102 of 410 GB/s used, waves stall
-   a full HBM latency per row) — straps cut latency, so this may move Bonsai TG well past the
-   +8-16% clock scaling. **HBM2 has no ECC here: md5-verify greedy output after EVERY step.**
+1. **HBM2 memory clock + timing straps** (decode lever, currently blocked on one reboot): all
+   seven cards report Samsung `61AB1A9C`; cards 1–6 run at 800 MHz, while the excluded Vega 64
+   BIOS card 7 has a different 945/1000 MHz profile. The current kernel command line uses
+   `amdgpu.ppfeaturemask=0xffff7fff`, which clears the overdrive bit: writes to
+   `pp_od_clk_voltage` do not apply. Reboot with `amdgpu.ppfeaturemask=0xffffffff`, then use
+   `benchmarks/llm/hbm-clock-completion-check.sh` on cards 1–3. It now refuses to benchmark
+   unless every requested clock is visible, generates a fresh 800 MHz separate-process oracle,
+   byte-compares greedy output, and restores 800 on exit. Start at 900 MHz and exclude card 7.
+   Only after clock scaling is proven should Eliovp `amdmemtweak` straps be tried. Our Q1_0
+   matvec is HBM-latency-bound, but **HBM2 has no ECC here: verify output after every step.**
 2. **GDN/SSM ops: PROFILED, LOW VALUE.** Direct GATED_DELTA_NET + SSM_CONV total 1.04 ms/token
    across all three devices (4.0% of GPU-op time, 2.9% wall). The profiler requires pipeline
    to be disabled via an unmatched tensor override; both normal and concurrent logger modes
