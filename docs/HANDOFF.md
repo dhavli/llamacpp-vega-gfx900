@@ -145,10 +145,13 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
 7. **Post-16GB-RAM reruns**: dual-instance C2/E1/E2 (aggregate PP should ≈ sum of pods —
    this is how 1000+ combined PP happens), 5-card 8×128k pod, and `cache_prompt: true`
    serving benefits (prompt-cache reuse needs host RAM).
-8. **Vulkan tensor parallelism (the decode endgame)**: pools all cards' bandwidth for the
-   matvec instead of layer-serializing. Upstream tracking issue
-   github.com/ggml-org/llama.cpp/issues/22648 — segfaults + missing get_tensor_2d as of
-   May 2026. Check monthly; do NOT try to build it ourselves yet.
+8. **Vulkan tensor parallelism (the decode endgame, POST-16GB)**: the pin already contains
+   merged Vulkan get/set-tensor-2d and the Qwen 3.5/3.6 three-GPU granularity fix (#23843),
+   correcting the stale May note. A bounded 3-GPU Qwen `-sm tensor -ts 1,1,1` pp512 smoke
+   test was nevertheless OOM-killed before model load on the 3.8 GB host (anon RSS only
+   ~130 MiB; pinned/GTT pressure). Upstream issue #22648 is now closed as not planned and
+   optimized Vulkan AllReduce is still absent; user reports include segfaults and speed
+   regressions. Retry the pinned path after 16 GB, but do not implement TP ourselves yet.
 9. **ACO-level micro-experiments: RESOLVED, NO WIN.** On the same current closure and full
    Bonsai production env, `ACO_DEBUG=nosched` regresses pp512 179.02 -> 150.84 (-15.7%) and
    pp2048 134.01 -> 115.02 (-14.2%). Do not disable ACO scheduling. The proposed odd LDS
