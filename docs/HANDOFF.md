@@ -124,11 +124,18 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
 3. **topk_moe fusion: CONFIRMED ACTIVE.** `GGML_VK_DISABLE_FUSION=1` drops decode 29.44 →
    24.87 and PP 519.69 → 507.66 with byte-identical output. The perf log explicitly names
    `TOPK_MOE_EARLY_SOFTMAX_NORM`, so the suspected view-node matcher miss is falsified.
-4. **Bonsai Q1_0 PREFILL kernel** — the single-Vega 1000 PP goal is blocked here (226 PP).
-   All ternary kernel work so far targeted the **matvec** (decode). Prefill goes through
-   generic dequant+mmq. A dedicated ternary *tile* kernel (dequant Q1_0 inline in the mmq
-   loop, reuse the TILE knob machinery) is the only credible route toward 500+ PP dense.
-   Sizeable shader work; the patch already has the scaffolding.
+4. **Bonsai Q1_0 PREFILL kernel: PREMISE CORRECTED, CONVENTIONAL PATH EXHAUSTED.** Prefill
+   does not use an untouched generic dequant+mmq path: the patch already supplies a dedicated
+   Q1_0 tile that dequantizes bits inline into LDS, uses SoA weights, packed-K f16vec2 FMAs,
+   odd LDS stride, tuned TILE_M, and optional (falsified) double buffering. A pp512 perf run
+   attributes 2.52/2.85 instrumented GPU seconds (88%) to Q1_0 matmuls at 9.5-11.0 dense-
+   equivalent TFLOP/s. The graph requires 24.94 TFLOP-equivalents per 512 tokens; even 100%
+   of ~22.8 TFLOP/s packed-f16 peak plus the measured non-matmul floor bounds this algorithm
+   near 359 PP on the 1590 MHz Vega56—below 500, let alone 1000. Further conventional tile,
+   FMA, LDS, and occupancy tuning cannot meet the target. Only a fundamentally different
+   bit-serial/activation-LUT algorithm that avoids most FMAs remains conceptually credible;
+   prior ISA shows LDS latency is already the decode bottleneck, so this is research, not a
+   missing implementation. Keep the verified 226 PP best as the practical gfx900 result.
 5. **TILE_L / TILE_S: RESOLVED, NO WIN.** Upstream explicitly disables both ordinary and
    routed-expert large matmul on AMD without cooperative matrices, so `GGML_VK_TILE_L` was
    inert—not an unswept active large-batch path. A guarded `GGML_VK_ENABLE_LARGE_MATMUL=1`
