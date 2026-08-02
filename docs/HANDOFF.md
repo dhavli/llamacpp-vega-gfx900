@@ -158,9 +158,13 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    row stride is already upstream: non-coopmat `SHMEM_STRIDE` is `BK / 2 + 1`, including the
    packed/double-buffer path. The hot packed loops already use `f16vec2`, and retained ISA
    evidence counts 2,352 `v_pk_fma_f16` instructions. There is no missing micro-knob here.
-10. **Classic speculative decode with a tiny draft** (e.g. Qwen 0.5B fully on device 0):
-    MTP died on per-step D2H embedding copies; a self-contained draft model avoids those but
-    still pays per-step logits sync — expect marginal at best on x1; only try if bored.
+10. **Classic speculative decode: FALSIFIED.** Qwen3.5-0.8B Q4_K_M was placed entirely on
+    a dedicated fourth Vega while the target stayed fixed on three cards. On the identical
+    5629+256 workload, control was 604.99 PP / 30.37 TG. Draft nmax3 reached 78.9% acceptance
+    but only 502.65 / 5.40; nmax5 reached 67.6% and 507.40 / 5.90. All output hashes match.
+    Separate-GPU placement avoids VRAM contention but not per-step logits synchronization on
+    Gen2 x1. Harness: `benchmarks/llm/server-draft-ab.sh`. The 508 MB draft was removed after
+    hashing to restore scarce disk space; do not redownload unless the PCIe topology changes.
 11. **Hardware paths** (user-side): Gen3-capable board/risers would double+ boundary
     bandwidth (the hardest wall for MoE multi-GPU prefill); reflash/retire the flaky
     `07:00.0` card (hang suspect); 16 GB RAM (committed).
