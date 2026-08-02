@@ -1,0 +1,36 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -778,6 +778,7 @@ struct ggml_sched_trace_stats {
+     uint64_t final_sync_us[GGML_SCHED_MAX_BACKENDS];
+     uint64_t async_copies[GGML_SCHED_MAX_BACKENDS];
+     uint64_t fallback_copies[GGML_SCHED_MAX_BACKENDS];
++    uint64_t fallback_bytes[GGML_SCHED_MAX_BACKENDS];
+ };
+ 
+ static ggml_sched_trace_stats g_sched_trace = {};
+@@ -802,7 +803,7 @@ static void ggml_sched_trace_report() {
+         fprintf(stderr,
+             "GGML_SCHED_TRACE backend=%d splits=%llu bytes=%llu event_wait_us=%llu "
+             "async_copies=%llu async_copy_us=%llu fallback_copies=%llu "
+-            "fallback_src_sync_us=%llu fallback_dst_sync_us=%llu fallback_copy_us=%llu "
++            "fallback_bytes=%llu fallback_src_sync_us=%llu fallback_dst_sync_us=%llu fallback_copy_us=%llu "
+             "submit_us=%llu final_sync_us=%llu\n",
+             i,
+             (unsigned long long) g_sched_trace.split_calls[i],
+@@ -811,6 +812,7 @@ static void ggml_sched_trace_report() {
+             (unsigned long long) g_sched_trace.async_copies[i],
+             (unsigned long long) g_sched_trace.async_copy_us[i],
+             (unsigned long long) g_sched_trace.fallback_copies[i],
++            (unsigned long long) g_sched_trace.fallback_bytes[i],
+             (unsigned long long) g_sched_trace.fallback_src_sync_us[i],
+             (unsigned long long) g_sched_trace.fallback_dst_sync_us[i],
+             (unsigned long long) g_sched_trace.fallback_copy_us[i],
+@@ -1758,6 +1760,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         if (trace) {
+                             g_sched_trace.fallback_copy_us[split_backend_id] += ggml_time_us() - trace_t0;
+                             g_sched_trace.fallback_copies[split_backend_id]++;
++                            g_sched_trace.fallback_bytes[split_backend_id] += ggml_nbytes(input);
+                         }
+                     } else if (trace) {
+                         g_sched_trace.async_copies[split_backend_id]++;

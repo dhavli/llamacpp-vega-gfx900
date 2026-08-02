@@ -1,0 +1,79 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1980,6 +1980,12 @@ struct ggml_backend_vk_context {
+ 
+     uint64_t last_total_mul_mat_bytes {};
+ 
++    // Opt-in, synchronization-free MUL_MAT_ID shape telemetry. Buckets are
++    // 1, 2-8, 9-32, 33-128, 129-256, 257-512, 513-1024, and >1024 tokens.
++    bool mul_mat_id_trace {};
++    uint64_t mul_mat_id_calls[2][8] {};
++    uint64_t mul_mat_id_q4k_calls[2][8] {};
++
+     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
+     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
+     const ggml_tensor * prealloc_y_last_tensor_used {};
+@@ -6709,6 +6745,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
+     ctx->name = GGML_VK_NAME + std::to_string(idx);
+ 
+     ctx->device = ggml_vk_get_device(idx);
++    ctx->mul_mat_id_trace = getenv("GGML_VK_MUL_MAT_ID_TRACE") != nullptr;
+ 
+     ctx->semaphore_idx = 0;
+     ctx->event_idx = 0;
+@@ -9610,13 +9616,33 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
+     return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+ }
+ 
++static int ggml_vk_mul_mat_id_token_bucket(int64_t n_tokens) {
++    if (n_tokens <= 1)    return 0;
++    if (n_tokens <= 8)    return 1;
++    if (n_tokens <= 32)   return 2;
++    if (n_tokens <= 128)  return 3;
++    if (n_tokens <= 256)  return 4;
++    if (n_tokens <= 512)  return 5;
++    if (n_tokens <= 1024) return 6;
++    return 7;
++}
++
+ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+     ggml_tensor * dst = cgraph->nodes[node_idx];
+     ggml_tensor * src0 = dst->src[0];
+     ggml_tensor * src1 = dst->src[1];
+     ggml_tensor * src2 = dst->src[2];
+     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
+-    if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
++    const bool use_vec = ggml_vk_use_mul_mat_vec_id(cgraph, node_idx);
++    if (ctx->mul_mat_id_trace) {
++        const int path = use_vec ? 0 : 1;
++        const int bucket = ggml_vk_mul_mat_id_token_bucket(src2->ne[1]);
++        ctx->mul_mat_id_calls[path][bucket]++;
++        if (src0->type == GGML_TYPE_Q4_K) {
++            ctx->mul_mat_id_q4k_calls[path][bucket]++;
++        }
++    }
++    if (use_vec) {
+         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
+     } else {
+         ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
+@@ -14704,6 +14728,19 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
+ static void ggml_backend_vk_free(ggml_backend_t backend) {
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
++    if (ctx->mul_mat_id_trace) {
++        static const char * bucket_names[] = { "1", "2-8", "9-32", "33-128", "129-256", "257-512", "513-1024", ">1024" };
++        for (int path = 0; path < 2; ++path) {
++            for (int bucket = 0; bucket < 8; ++bucket) {
++                if (ctx->mul_mat_id_calls[path][bucket] != 0) {
++                    fprintf(stderr, "GGML_VK_MUL_MAT_ID_TRACE device=%d path=%s tokens=%s calls=%llu q4k_calls=%llu\n",
++                            ctx->device->idx, path == 0 ? "vec" : "mm", bucket_names[bucket],
++                            (unsigned long long) ctx->mul_mat_id_calls[path][bucket],
++                            (unsigned long long) ctx->mul_mat_id_q4k_calls[path][bucket]);
++                }
++            }
++        }
++    }
+ 
+     ggml_vk_cleanup(ctx);
+ 

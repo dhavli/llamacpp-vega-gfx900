@@ -430,3 +430,29 @@ The research-led backport of upstream PR #25862 (`5cea9089`, high-expert-count v
 was also neutral at 528.56 PP versus 528.72 control, with identical output, and was removed.
 The next implementation step is pipeline-safe boundary/kernel tracing, not another blind
 tile sweep; see `docs/qwen4-optimization-roadmap.md`.
+
+## 5i. Pipeline-safe scheduler trace and copy-path adjudication (2026-08-03)
+
+An opt-in host-side scheduler tracer was added because Vulkan's existing per-op logger changes
+pipeline behavior. With tracing disabled, the winning four-card split measured 560.12 PP / 35.76
+TG and remained byte-identical. Trace-on prefill-only runs measured 557.17–561.74 PP, so its PP
+perturbation is small enough for boundary diagnosis; it is not suitable for TG ranking because a
+full trace-on run reduced TG by about 8%.
+
+The trace found 24 synchronous fallback copies and 46,129,200 bytes at each of the three
+downstream device boundaries. Their GPU-staged copy legs totaled roughly 0.8 seconds within a
+10.1-second prefill, setting an approximate 8% ceiling for copy-only work. Dedicated transfer
+queues did not improve either PP (562.21 versus the same ~562 trace band) or copy timings.
+
+A guarded direct copy between coherent host-visible mappings then provided a decisive negative
+control. PP collapsed to 269.31, while boundary copy time rose to 2.86, 8.53, and 0.29 seconds
+(~11.7 seconds total), versus roughly 0.26–0.29 seconds per boundary through staging. This is
+consistent with very slow CPU reads through uncached/BAR mappings on the rig. The direct-copy
+patch was removed; the diagnostic scheduler tracer remains available behind
+`GGML_SCHED_CRITICAL_TRACE=1`.
+
+The follow-up fixed-counter Vulkan shape trace is synchronization-free and did not perturb
+prefill: 558.42 PP. Across devices, Q4_K prefill generated 198–242 `MUL_MAT_ID` calls per card,
+all in the 257–512-token MM bucket. Q4_K vec calls appeared only in the 2–8-token tail (16–22
+per card). Consequently, changing the vec/MM cutoff cannot improve the main prefill workload;
+the next kernel candidate is deterministic row-ID precompaction for the MM path.

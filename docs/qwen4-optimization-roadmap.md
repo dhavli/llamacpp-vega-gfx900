@@ -41,18 +41,26 @@ Hard configuration findings:
 
 ## Ranked implementation work
 
-1. Add a pipeline-safe critical-path tracer around scheduler split dispatch and Vulkan
-   cross-device copies. Record per-ubatch stage submit/start/end, boundary bytes, source wait,
-   host staging, destination wait, and overlap without enabling the existing perf logger
-   (which disables/asserts with pipeline parallelism). This decides whether the remaining PP
-   ceiling is Q4_K expert kernels or Gen2-x1 boundary bubbles.
-2. Add shape/path histograms for Q4_K `MUL_MAT_ID`: expert token-count buckets, selected
-   vec/mm path, ncols, tile, and device. Only then try geometry-preserving bucketed kernels,
-   ID metadata coalescing, or a second staging slot for in-flight ubatches.
-3. Test Vulkan command-buffer graph reuse from upstream PR #24720 behind an opt-in build.
+1. **Completed:** an opt-in pipeline-safe scheduler tracer now records split counts, boundary
+   bytes, event waits, asynchronous and fallback-copy time, source/destination synchronization,
+   submit time, and final synchronization without enabling Vulkan's pipeline-hostile perf logger.
+   On the 5,629-token prefill, each downstream boundary moved 46,129,200 bytes in 24 fallback
+   copies; the three staged-copy legs consumed about 0.8 seconds of a 10.1-second prefill. A
+   direct coherent mapped-memory copy was tested and rejected: uncached/BAR reads inflated copy
+   time to roughly 11.7 seconds and collapsed PP to 269.31. Dedicated transfer queues were
+   neutral. Keep staged copies until a genuinely asynchronous/double-buffered design is ready.
+2. **Completed:** synchronization-free fixed-counter histograms show that real prefill Q4_K
+   dispatches are exclusively in the 257–512-token MM bucket (198–242 calls per card). The
+   only vec calls are the 2–8-token final/decode tail. This removes a vec/MM cutoff sweep from
+   the prefill candidate list.
+3. **Next:** precompute compact per-expert row IDs once in the existing routing preparation
+   phase, preserving flattened scan order, then let every Q4_K MM-ID workgroup directly consume
+   its expert range instead of rescanning the full IDs tensor. Keep the generic scan as a gated
+   fallback and output/perplexity-gate the new path.
+4. Test Vulkan command-buffer graph reuse from upstream PR #24720 behind an opt-in build.
    The 2-core Celeron makes submission overhead plausible, but upstream reports no measured
    gain; require at least 2% TG plus multi-turn server correctness.
-4. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
+5. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
    experimental Vulkan AllReduce. Do not attempt it on the current 3.8 GB host.
 
 ## Upstream audit conclusions
