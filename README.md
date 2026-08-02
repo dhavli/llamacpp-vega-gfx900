@@ -62,6 +62,17 @@ PPL is 131.42 vs 131.03 (a 0.30% delta, inside error), three deterministic tasks
 quality-equivalent, and the long-prompt probe improves from 519.7/29.4 to 559.1/31.1 PP/TG.
 This narrow evaluation does not establish broad no-loss quality, so top-8 remains the default.
 
+Per-op Vulkan profiling also rules out the fused GDN kernels as a large decode lever. Across
+three devices, `GATED_DELTA_NET` + `SSM_CONV_SILU` total only **1.04 ms/token**—4.0% of
+instrumented GPU-op time and 2.9% of wall time. The logger requires pipeline parallelism to
+be disabled in this revision, so absolute performance is perturbed, but even a perfect 2×
+kernel improvement would move wall time by only ~1.5%.
+
+The Qwen MoE fusion matcher does fire: perf logs contain
+`TOPK_MOE_EARLY_SOFTMAX_NORM`, and disabling all Vulkan fusion drops decode from 29.44 to
+24.87 t/s (−15.5%) with byte-identical text. The suspected view-node matcher miss is not
+present in this build; the existing fusion path should be preserved.
+
 Note the direction: MoE prefill gets **worse** with more cards (641 → 561 → 506 at pp2048),
 the opposite of the dense model, which *gained* from 3 cards at long prompts. A3B does roughly
 a ninth of the matmul per token, so per-stage work is small relative to the fixed per-boundary

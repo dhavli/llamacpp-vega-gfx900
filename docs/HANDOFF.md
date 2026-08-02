@@ -66,6 +66,8 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 | `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` | +4% TG alone |
 | `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` | server 3.77 → 29.70 TG (7.9×), short PP 22.8 → 134.2; restores parity with completion (32.47 TG) |
 | Real server 4×128k concurrency | all four requests complete, but streams get only 130-492 PP / 3.4-13.0 TG; serialize to one active request/pod for the ≥500/25 SLA |
+| GDN/SSM per-op profile | direct GATED_DELTA_NET + SSM_CONV = 1.04 ms/token, only 2.9% of wall; kernel work here is low value |
+| Vulkan/top-k MoE fusion is active | disabling fusion: 519.69/29.44 → 507.66/24.87, byte-identical; perf log names TOPK_MOE_EARLY_SOFTMAX_NORM |
 | `-b 4096 -ub 256` | PP 449 vs 519 base — smaller ubatch hurts; `-ub 1024` run produced no output (check `/tmp/qa-ub1024.log` for the failure mode) |
 | Perplexity runs OOM the box | 248320 vocab × batch × 4 B logits buffer. Default 2048 (2 GB) and even `-b 512` (508 MB) OOM-kill this host. **Always use `--no-mmap -b 128`**; P4 completed with ~0.9 GB minimum available RAM. |
 | PCIe survey | all 7 cards Gen2 x1; decode traffic ~4 KB/tok/boundary (fine), prefill ~MB/ubatch/boundary (why MoE prefill decays with card count) |
@@ -112,14 +114,13 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    research report). Our Q1_0 matvec is HBM-LATENCY-bound (102 of 410 GB/s used, waves stall
    a full HBM latency per row) — straps cut latency, so this may move Bonsai TG well past the
    +8-16% clock scaling. **HBM2 has no ECC here: md5-verify greedy output after EVERY step.**
-2. **Profile the GDN/SSM ops** — nobody has ever profiled the non-matmul half of these models.
-   30/40 Qwen layers and 48/64 Bonsai layers are gated-delta-net; `ssm_scan`/`ssm_conv` Vulkan
-   kernels are stock and unexamined. `GGML_VK_PERF_LOGGER=1` (+`_FREQUENCY`) gives per-op times.
-   If GDN ops eat a meaningful decode share, that's a fresh, uncontested optimization surface.
-3. **Verify the topk_moe fusion actually fires** on qwen35moe: the graph interleaves RESHAPE/
-   cache-view nodes that break fusion matchers silently (we hit this before with SIGMOID+MUL).
-   A/B with `GGML_VK_DISABLE_FUSION=1`; if no delta, the matcher never fired → relax it in the
-   patch (contained decode win, all 40 layers).
+2. **GDN/SSM ops: PROFILED, LOW VALUE.** Direct GATED_DELTA_NET + SSM_CONV total 1.04 ms/token
+   across all three devices (4.0% of GPU-op time, 2.9% wall). The profiler requires pipeline
+   to be disabled via an unmatched tensor override; both normal and concurrent logger modes
+   assert during warmup otherwise. Do not prioritize these kernels.
+3. **topk_moe fusion: CONFIRMED ACTIVE.** `GGML_VK_DISABLE_FUSION=1` drops decode 29.44 →
+   24.87 and PP 519.69 → 507.66 with byte-identical output. The perf log explicitly names
+   `TOPK_MOE_EARLY_SOFTMAX_NORM`, so the suspected view-node matcher miss is falsified.
 4. **Bonsai Q1_0 PREFILL kernel** — the single-Vega 1000 PP goal is blocked here (226 PP).
    All ternary kernel work so far targeted the **matvec** (decode). Prefill goes through
    generic dequant+mmq. A dedicated ternary *tile* kernel (dequant Q1_0 inline in the mmq
