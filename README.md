@@ -30,11 +30,17 @@ hardware — 3× the prefill and better decode — because prefill is FLOP-bound
 doesn't ask for the FLOPs these cards can't deliver. On 3 cards a real 5629-token prompt
 prefills at **624 t/s** and then generates at **30.8 t/s**.
 
+The best validated four-card top-8 profile combines the graphics queue with an explicit
+layer split: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1 -ts 0.85,1.05,1.05,1.05`. On the real
+5,629-token prompt it reaches **559.74 PP / 35.56 TG**, versus 528.72 / 30.65 for the default
+queue/split, with byte-identical output. See `docs/qwen4-optimization-roadmap.md`.
+
 Controlled clock experiments on cards 1–3 found that 900 MHz HBM raises deterministic
 decode from 30.93 to **33.18 t/s** (+7.3%) with byte-identical output. 950 MHz did not improve
 on that result. A 1700 MHz / 1200 mV core clock is stable and byte-identical but not useful:
 decode changed 33.82 → 33.55 t/s, pp2048 578.09 → 583.70 (+1.0%), and pp8192 524.39 →
-527.82 (+0.7%). Keep the stock core clock; 900 MHz HBM is the only proven clock win.
+527.82 (+0.7%). Keep the stock core clock. The 900 MHz HBM gain is specific to the three-card
+short probe; it is neutral on the four-card production workload and should not be deployed.
 
 ### Archived Bonsai result
 

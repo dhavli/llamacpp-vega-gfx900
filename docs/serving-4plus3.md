@@ -76,7 +76,9 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
   run produced 3.4-13.0 TG per stream depending on scheduler interleaving. Solo mode is the
   only measured configuration that meets ≥25 TG per active stream.
 - Single-stream decode tuning: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` is the measured winner
-  (29.44 → 34.87 t/s, byte-identical output). It does **not** stack additively with the
+  (29.44 → 34.87 t/s historically; 30.65 → 35.47 in the latest production-prompt A/B,
+  byte-identical output). Pair it with `-ts 0.85,1.05,1.05,1.05` on the forward-ordered
+  four-card pod: PP improves 529.67 → 559.74 while TG holds 35.56. It does **not** stack additively with the
   conservative `RADV_PERFTEST=nogttspill` policy: graphics + nogttspill gives 32.08 t/s,
   and adding the async transfer queue gives 33.78 t/s. Keep `nogttspill` in the launch
   commands so an over-capacity configuration fails instead of silently paging weights over

@@ -403,3 +403,30 @@ pp2048 was 578.09 ± 1.44 and pp8192 was 524.39 ± 2.51. At 1700 MHz they were 5
 (+1.0%) and 527.82 ± 3.43 (+0.7%), respectively—inside variance and far below the 6.9% clock
 increase. Combined with flat decode, 1700 MHz adds power without useful Qwen throughput and
 should not be deployed.
+
+## 5h. Four-card Qwen software/pipeline tuning (2026-08-02)
+
+The real 5,629-token top-8 workload proves that the four-card bottleneck is not clock speed.
+At the default queue/split, 800→900 MHz HBM changed 528.72/30.65 PP/TG to 530.64/30.76
+(+0.36% on both). With graphics queue it changed 529.90/34.04 to 532.59/33.43 (+0.5% PP,
+-1.8% TG). Every output was byte-identical; HBM was restored to 800 MHz.
+
+Software placement did move the result materially:
+
+| configuration | PP | TG | output |
+|---|---:|---:|---|
+| default queue and split | 528.72 | 30.65 | oracle |
+| graphics queue | 529.67 | 35.47 | identical |
+| graphics + `-ts 0.85,1.05,1.05,1.05` | **559.74** | **35.56** | identical |
+| graphics + `-ts 0.70,1.10,1.10,1.10` | 560.09 | 33.36 | identical |
+| first custom split + top-6 | **608.61** | 33.66 | semantics changed |
+
+The first custom split is the top-8 Pareto winner: +5.7% PP over graphics/default split
+without losing decode. Forward device order is mandatory; reversing `0,1,2,3` to `3,2,1,0`
+collapsed performance to 88.55 PP / 2.81 TG. `-ub 1024` became pathologically slow after
+normal model load and was terminated; retain 512.
+
+The research-led backport of upstream PR #25862 (`5cea9089`, high-expert-count vec-ID path)
+was also neutral at 528.56 PP versus 528.72 control, with identical output, and was removed.
+The next implementation step is pipeline-safe boundary/kernel tracing, not another blind
+tile sweep; see `docs/qwen4-optimization-roadmap.md`.

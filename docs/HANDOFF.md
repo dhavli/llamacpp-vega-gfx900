@@ -50,6 +50,12 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   active. Logs: `/root/bonsai/{recover2,followup,ppl-tile-ab}.log`.
 - Pipeline parallelism is enabled. The env stacks are non-additive. The Qwen TILE_M candidate
   is falsified by perplexity. These results are recorded in `benchmarks/llm/index.jsonl`.
+- New best four-card top-8 shallow profile: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` plus
+  `-ts 0.85,1.05,1.05,1.05` reaches **559.74 PP / 35.56 TG** on the real 5,629-token prompt,
+  versus 528.72 / 30.65 default, byte-identical. Preserve device order `0,1,2,3`; reversing
+  it collapses to 88.55 / 2.81. See `docs/qwen4-optimization-roadmap.md`.
+- Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
+  graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
   experimental gate (PPL +0.30%, three complete tasks quality-equivalent).
 - A server-only 8.6× decode regression was found and fixed behind
