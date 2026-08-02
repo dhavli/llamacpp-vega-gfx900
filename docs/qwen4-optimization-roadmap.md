@@ -53,11 +53,12 @@ Hard configuration findings:
    dispatches are exclusively in the 257–512-token MM bucket (198–242 calls per card). The
    only vec calls are the 2–8-token final/decode tail. This removes a vec/MM cutoff sweep from
    the prefill candidate list.
-3. **Next:** precompute compact per-expert row IDs once in the existing routing preparation
-   phase, preserving flattened scan order, then let every Q4_K MM-ID workgroup directly consume
-   its expert range instead of rescanning the full IDs tensor. Keep the generic scan as a gated
-   fallback and output/perplexity-gate the new path.
-4. Test Vulkan command-buffer graph reuse from upstream PR #24720 behind an opt-in build.
+3. **Completed / neutral:** deterministic per-expert row-ID precompaction was implemented behind
+   an opt-in path. A portable shared-prefix preparation was byte-identical but regressed to
+   549.02 PP. A subgroup-ballot refinement was also byte-identical and recovered 559.22 PP,
+   only +0.14% over the 558.42 traced control. The patch and its ~4 MiB/card ubatch scratch were
+   removed because they do not clear the adoption threshold.
+4. **Next:** test Vulkan command-buffer graph reuse from upstream PR #24720 behind an opt-in build.
    The 2-core Celeron makes submission overhead plausible, but upstream reports no measured
    gain; require at least 2% TG plus multi-turn server correctness.
 5. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and

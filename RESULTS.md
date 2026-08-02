@@ -456,3 +456,11 @@ prefill: 558.42 PP. Across devices, Q4_K prefill generated 198–242 `MUL_MAT_ID
 all in the 257–512-token MM bucket. Q4_K vec calls appeared only in the 2–8-token tail (16–22
 per card). Consequently, changing the vec/MM cutoff cannot improve the main prefill workload;
 the next kernel candidate is deterministic row-ID precompaction for the MM path.
+
+That precompaction candidate was subsequently exhausted. The correctness-first implementation
+used a stable flattened-order shared prefix scan, produced byte-identical output, but regressed
+prefill to 549.02 PP. Replacing its preparation scan with the same subgroup-ballot ordering model
+already used by the production MM-ID shader restored 559.22 PP with identical output. This is
+only +0.14% over the 558.42 shape-trace control and does not clear noise or the 2% adoption gate.
+The candidate and its roughly 4 MiB/card per-ubatch scratch allocation were removed. Repeated
+routing scans are therefore not a material four-card bottleneck on this workload.
