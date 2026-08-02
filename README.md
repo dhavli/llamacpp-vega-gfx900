@@ -37,6 +37,19 @@ hardware — 3× the prefill and better decode — because prefill is FLOP-bound
 doesn't ask for the FLOPs these cards can't deliver. On 3 cards a real 5629-token prompt
 prefills at **624 t/s** and then generates at **30.8 t/s**.
 
+The best safe single-stream runtime knob found so far is
+`GGML_VK_ALLOW_GRAPHICS_QUEUE=1`: on four cards it raises decode from **29.44 to 34.87 t/s**
+(+18%) with byte-identical greedy output and unchanged prefill. The gains do not add:
+combining it with `RADV_PERFTEST=nogttspill` gives 32.08 t/s, or 33.78 with the async
+transfer queue added. Pipeline parallelism was confirmed enabled at the default
+`-b 2048 -ub 512`; its diagnostic line is simply hidden without `--verbose`.
+
+The tempting Q4_K prefill override
+`GGML_VK_TILE_M=256,128,64,64,32,64,2,4,4,1,64` is **invalid for this model**. Despite a
+19% throughput gain and roughly 140 lines of identical greedy output, its measured
+perplexity is **3,583,951 vs 131.03** for the default tile. Tile correctness is kernel-path
+specific: this value remains verified for Bonsai Q1_0, but must not be exported for Qwen.
+
 Note the direction: MoE prefill gets **worse** with more cards (641 → 561 → 506 at pp2048),
 the opposite of the dense model, which *gained* from 3 cards at long prompts. A3B does roughly
 a ninth of the matmul per token, so per-stage work is small relative to the fixed per-boundary

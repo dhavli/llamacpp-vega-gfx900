@@ -1,4 +1,4 @@
-# HANDOFF — Vega 7-GPU inference tuning (2026-08-02, ~08:00 UTC)
+# HANDOFF — Vega 7-GPU inference tuning (2026-08-02, ~08:30 UTC)
 
 Context for the next agent picking up this work. Read this top to bottom before touching
 the rig. The prior session log lives in the repo history and `benchmarks/llm/index.jsonl`
@@ -38,18 +38,14 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 
 ## State of the rig RIGHT NOW
 
-- `recover2.sh` was finishing its last matrix run (`qa-e6`); `followup.sh` (PID ~357660)
-  is queued behind it via a pgrep poll. Logs: `/root/bonsai/recover2.log`,
-  `/root/bonsai/followup.log`; sentinels `### RECOVERDONE`, `### FOLLOWUPDONE`.
-- `followup.sh` will produce, in order:
-  1. **V:** `--verbose` init on 4 cards → grep `pipeline|n_copies|retrying without` from
-     `/tmp/qv.log` — diagnoses whether/why pipeline parallelism is disabled (see below).
-  2. **QB:** stacked combos `nogttspill+ALLOW_GRAPHICS_QUEUE` and `+ASYNC_USE_TRANSFER_QUEUE`,
-     byte-diffed against `/tmp/qa-base.txt`.
-  3. **P3:** TILE_M perplexity A/B with **`-b 512`** (RAM-safe) → `/tmp/p3-{ctrl,tile}.pplout`.
-     This adjudicates the +19% prefill warptile (see "Pending verdicts").
-- When both sentinels are present: record everything in `benchmarks/llm/index.jsonl`,
-  update README + `docs/serving-4plus3.md` env lines, push.
+- `recover2.sh`, `followup.sh`, and the corrected `ppl-tile-ab.sh` have finished; sentinels
+  `### RECOVERDONE`, `### FOLLOWUPDONE`, and `### P4DONE` are present. No benchmark should be
+  active. Logs: `/root/bonsai/{recover2,followup,ppl-tile-ab}.log`.
+- Pipeline parallelism is enabled. The env stacks are non-additive. The Qwen TILE_M candidate
+  is falsified by perplexity. These results are recorded in `benchmarks/llm/index.jsonl`.
+- `ppl-expert-ab.sh` is now running the `expert_used_count=6` quality A/B against normal
+  top-8 using `--no-mmap -b 128`; log `/root/bonsai/ppl-expert-ab.log`, sentinel `### P5DONE`.
+  If perplexity remains close, follow with several fixed task prompts.
 
 ## Confirmed results (all output-verified; ledger has full records)
 
@@ -65,7 +61,7 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 | `GGML_VK_ASYNC_USE_TRANSFER_QUEUE=1` | +2% alone; combo gtt+tq (30.3) < gtt alone (31.7) — tq slightly hurts when stacked |
 | `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` | +4% TG alone |
 | `-b 4096 -ub 256` | PP 449 vs 519 base — smaller ubatch hurts; `-ub 1024` run produced no output (check `/tmp/qa-ub1024.log` for the failure mode) |
-| Perplexity runs OOM the box | 248320 vocab × 2048 batch × 4 B = 2 GB logits buffer on host. **Always `-b 512`** (508 MB). This OOM (not MTP, not the flaky card — probably) is what took the rig down overnight |
+| Perplexity runs OOM the box | 248320 vocab × batch × 4 B logits buffer. Default 2048 (2 GB) and even `-b 512` (508 MB) OOM-kill this host. **Always use `--no-mmap -b 128`**; P4 completed with ~0.9 GB minimum available RAM. |
 | PCIe survey | all 7 cards Gen2 x1; decode traffic ~4 KB/tok/boundary (fine), prefill ~MB/ubatch/boundary (why MoE prefill decays with card count) |
 | MoE vs dense splitting | MoE prefill DECREASES with cards (641/561/506 @ pp2048 for 3/4/6); dense increases at depth. Decode optimum 4 cards, prefill optimum 3 |
 
@@ -73,34 +69,30 @@ Earlier falsifications (README "Falsified" section): fast-but-wrong warptiles (T
 **never** trust throughput without byte-identical greedy output), VGPR diet, LDS→ALU,
 f16 accumulators, `-sm row` on Vulkan (CUDA-only).
 
-## Pending verdicts (followup.sh output)
+## Followup verdicts
 
-1. **Pipeline parallelism (PP overlap) — potentially the biggest free prefill lever.**
-   `qa-base` showed NO "pipeline parallelism enabled" log line at default verbosity (which
-   also hides most init logs — hence the verbose rerun). Gates (from source,
-   `src/llama-context.cpp` ~395-424): >1 device, `n_gpu_layers > n_layer_total` (99>41 ok),
-   layer split, `offload_kqv`, NO `--override-tensor`, all backends async+events (Vulkan
-   claims both). Plus a **silent fallback** at ~line 644 when the compute buffer alloc fails
-   ("retrying without pipeline parallelism"). If disabled: find which gate, fix, then REDO
-   the `-b`/`-ub` sweep (the current one is meaningless if PP was off). If enabled all along:
-   the MoE-prefill-decay finding stands as boundary-copy cost.
-2. **TILE_M candidate `256,128,64,64,32,64,2,4,4,1,64`** (+19% PP on both pods, decode
-   neutral). Greedy text diverges ~140 lines in — benign-FP-reorder signature, NOT the
-   garbage signature. P3 perplexity decides: ppl match to 3-4 digits vs ctrl = adopt (put in
-   blueprint env); big delta = falsify and record.
-3. **Stacked combos**: expect gfx+gtt ≈ 36-38 TG. If confirmed AND output byte-identical,
-   blueprint decode goes 52 → ~60+ aggregate on pod A.
-4. **`expert_used_count=6`** (`qa-e6` in recover2.log): read timings + eyeball
-   `/tmp/qa-e6.txt` coherence. If fast and sane, it needs a REAL quality eval
-   (ppl A/B at `-b 512` + a few task prompts) before entering the blueprint as an option.
+1. **Pipeline parallelism: CONFIRMED ENABLED.** The line appears twice with `--verbose`; it
+   was merely hidden at normal verbosity. No buffer-allocation fallback occurred, so the
+   MoE-prefill-decay finding and prior batch/ubatch sweep remain valid.
+2. **TILE_M candidate `256,128,64,64,32,64,2,4,4,1,64`: FALSIFIED for Qwen Q4_K.**
+   RAM-safe P4 (`--no-mmap -b 128`) measured PPL 3,583,950.87 vs control 131.0328. The
+   ~140-line greedy prefix was misleading. Never use this override for Qwen; it remains
+   independently verified for the Bonsai Q1_0 path only. `-b 512` still OOM-killed this
+   3.8 GB host; use `--no-mmap -b 128` for all further Qwen perplexity runs.
+3. **Stacked combos: confirmed non-additive.** gfx+gtt = 32.08 TG; adding transfer queue =
+   33.78, both byte-identical but below graphics queue alone at 34.87. Use `nogttspill` as a
+   conservative fit/fail policy, not as the peak-throughput configuration.
+4. **`expert_used_count=6`**: 559.1 PP / 31.13 TG versus 519.69 / 29.44 control
+   (+7.6% / +5.7%); output is coherent but differs by design. It needs a REAL quality eval
+   (ppl A/B with `--no-mmap -b 128` + task prompts) before entering the blueprint.
 
 ## PP/TG improvement paths — tried, in-flight, and UNTRIED
 
 ### In-flight / next in queue
-- Pipeline-parallelism diagnosis → possibly re-sweep `-b/-ub` after fix (PP lever, MoE+dense).
-- TILE_M adjudication (PP +19% if clean).
-- Stacked env combos (TG +25-30% if they stack cleanly).
-- expert_used_count 6/7 (TG and PP, ~linear in expert count; quality tradeoff).
+- expert_used_count 6/7 quality tradeoff; the measured gain is only +6-8%, not linear in
+  expert count. Use low-RAM perplexity and task prompts before considering it deployable.
+- Production-shape A/B of graphics queue alone versus conservative nogttspill stacks; the
+  34.87 TG winner is single-stream at 8k, not yet a 4×128k serving measurement.
 
 ### Untried — ordered by expected value/effort (from the research pass + local analysis)
 1. **HBM2 memory clock + timing straps** (decode lever, mining-proven on these exact cards):
@@ -157,8 +149,10 @@ forbids; also 2-core Celeron).
 - **Throughput without byte-identical greedy output is not a result.** `llama-bench` never
   checks output; invalid warptiles run fast and compute garbage. Always
   `llama-completion --temp 0 --ignore-eos -f prompt8k.txt -n 128..256`, `cmp` the outputs.
-  Late divergence (>100 identical lines) = FP reorder → adjudicate with perplexity, `-b 512`.
-- **Perplexity = 2 GB host logits buffer at default batch** (248k vocab). `-b 512` always.
+  Late divergence (>100 identical lines) is only a reason to adjudicate, not evidence of
+  correctness: the falsified TILE_M candidate matched ~140 lines before PPL exploded.
+- **Perplexity = 2 GB host logits buffer at default batch** (248k vocab), and `-b 512` also
+  OOM-kills this host. Use `--no-mmap -b 128`; see `benchmarks/llm/ppl-tile-ab.sh`.
 - **Speculative flags**: `llama-batched-bench` never has them; `llama-completion` lacks them;
   `llama-cli` HAS them but falls into conversation mode (`-no-cnv` needed; it once dumped
   2.8 GB to stdout). For spec tests use **llama-server + /completion** (also gives

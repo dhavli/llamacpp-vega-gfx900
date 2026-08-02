@@ -22,7 +22,7 @@ and fewer boundaries per pod beat more GPUs per pod at equal load
 
 Total: 5-6 streams at 128k-class context ≥ the 4×128k / 512k goal.
 
-## Launch (validated flags; env knobs pending the recover.sh A/B)
+## Launch (validated flags; conservative no-spill policy)
 
 ```bash
 # Pod A - 4 cards
@@ -54,8 +54,18 @@ Route long-context/batch work to pod A, latency-sensitive single streams to pod 
 
 ## Expected numbers (from measured baselines, b9599 + patch)
 
-- Aggregate prefill both pods busy: ~1000-1150 t/s; +19% if the TILE_M candidate
-  passes perplexity adjudication (~1200-1350).
+- Aggregate prefill both pods busy: ~1000-1150 t/s. Do **not** set the Bonsai production
+  `GGML_VK_TILE_M` value for this Qwen Q4_K model: although it appeared 19% faster and kept
+  a long greedy prefix, perplexity exploded from 131.03 to 3.58 million.
 - Decode: pod A 52 t/s aggregate at 4 active streams (32 solo); pod B 31 solo.
-- Pending multipliers: MTP self-speculation (`--spec-type draft-mtp`, crash-suspect,
-  re-test last), expert_used_count 8→6 (~25% less expert work, quality eval first).
+- Single-stream decode tuning: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` is the measured winner
+  (29.44 → 34.87 t/s, byte-identical output). It does **not** stack additively with the
+  conservative `RADV_PERFTEST=nogttspill` policy: graphics + nogttspill gives 32.08 t/s,
+  and adding the async transfer queue gives 33.78 t/s. Keep `nogttspill` in the launch
+  commands so an over-capacity configuration fails instead of silently paging weights over
+  Gen2 x1; use graphics-queue alone only after the exact production slot/context allocation
+  is proven to fit.
+- `expert_used_count` 8→6 improves the 5.6k-prompt probe to 559 PP / 31.1 TG, but changes
+  model semantics and remains experimental until perplexity and task-quality evaluation.
+- MTP self-speculation is **not** a pending multiplier on this rig: it was 7.6× slower at
+  79% acceptance because every draft step pays device-to-host traffic over Gen2 x1.
