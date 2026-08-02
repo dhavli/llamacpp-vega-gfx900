@@ -136,9 +136,12 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    pp8192 still had not completed after roughly five minutes, so it was terminated. Do not
    sweep L on GCN. The active small tile's conservative K-depth scan was flat: BK16 530.97,
    default BK32 530.47, BK64 529.05 PP; differences are within ~0.3%, so retain BK32.
-6. **Scalar FA follow-ups for hsk=256** (our GDN-attention decode shape): the GCN occupancy
-   clamp is in-tree (`ggml-vulkan.cpp:~3220`); check upstream for FA tuning merged after
-   b9599 and cherry-pick into the prism pin.
+6. **Scalar FA follow-ups for hsk=256: RESOLVED, NO WIN.** The post-b9599 upstream audit
+   found two relevant changes. `VK_VALVE_shader_mixed_float_dot_product` acceleration is
+   unavailable because Mesa 26.1.5 exposes neither that extension nor its feature on these
+   Vegas. Upstream #24362 disables `mask_opt` on GCN for HSK/HSV <=256, but a clean backport
+   regressed Qwen pp2048 530.54 -> 527.63 (-0.55%) and pp8192 477.92 -> 464.93 (-2.72%).
+   The candidate was rejected; keep the pinned mask heuristic and existing occupancy clamp.
 7. **Post-16GB-RAM reruns**: dual-instance C2/E1/E2 (aggregate PP should ≈ sum of pods —
    this is how 1000+ combined PP happens), 5-card 8×128k pod, and `cache_prompt: true`
    serving benefits (prompt-cache reuse needs host RAM).
