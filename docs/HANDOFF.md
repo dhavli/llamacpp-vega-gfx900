@@ -129,8 +129,13 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    generic dequant+mmq. A dedicated ternary *tile* kernel (dequant Q1_0 inline in the mmq
    loop, reuse the TILE knob machinery) is the only credible route toward 500+ PP dense.
    Sizeable shader work; the patch already has the scaffolding.
-5. **TILE_L / TILE_S sweeps** — only TILE_M (medium path) was ever swept. Large-batch prefill
-   uses the L path: same sweep methodology (greedy byte-diff + ppl adjudication), 4-card pod.
+5. **TILE_L / TILE_S: RESOLVED, NO WIN.** Upstream explicitly disables both ordinary and
+   routed-expert large matmul on AMD without cooperative matrices, so `GGML_VK_TILE_L` was
+   inert—not an unswept active large-batch path. A guarded `GGML_VK_ENABLE_LARGE_MATMUL=1`
+   A/B now exists: the stock large tile cut Qwen pp2048 from 530.47 to 285.11 (-46.3%), and
+   pp8192 still had not completed after roughly five minutes, so it was terminated. Do not
+   sweep L on GCN. The active small tile's conservative K-depth scan was flat: BK16 530.97,
+   default BK32 530.47, BK64 529.05 PP; differences are within ~0.3%, so retain BK32.
 6. **Scalar FA follow-ups for hsk=256** (our GDN-attention decode shape): the GCN occupancy
    clamp is in-tree (`ggml-vulkan.cpp:~3220`); check upstream for FA tuning merged after
    b9599 and cherry-pick into the prism pin.
