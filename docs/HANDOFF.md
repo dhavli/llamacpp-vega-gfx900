@@ -107,16 +107,17 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
   Next serving gate is the post-16GB two-pod run with one admitted request per pod.
 
 ### Untried — ordered by expected value/effort (from the research pass + local analysis)
-1. **HBM2 memory clock + timing straps** (decode lever, currently blocked on one reboot): all
-   seven cards report Samsung `61AB1A9C`; cards 1–6 run at 800 MHz, while the excluded Vega 64
-   BIOS card 7 has a different 945/1000 MHz profile. The current kernel command line uses
-   `amdgpu.ppfeaturemask=0xffff7fff`, which clears the overdrive bit: writes to
-   `pp_od_clk_voltage` do not apply. Reboot with `amdgpu.ppfeaturemask=0xffffffff`, then use
-   `benchmarks/llm/hbm-clock-completion-check.sh` on cards 1–3. It now refuses to benchmark
-   unless every requested clock is visible, generates a fresh 800 MHz separate-process oracle,
-   byte-compares greedy output, and restores 800 on exit. Start at 900 MHz and exclude card 7.
-   Only after clock scaling is proven should Eliovp `amdmemtweak` straps be tried. Our Q1_0
-   matvec is HBM-latency-bound, but **HBM2 has no ECC here: verify output after every step.**
+1. **HBM2 memory clock: PROVEN DECODE LEVER.** The rig now boots with
+   `amdgpu.ppfeaturemask=0xffffffff` (the former `0xffff7fff` source and both generated GRUB
+   configs are backed up with suffix `.20260802-codex-ppfeaturemask.bak`). Cards 1–3 at
+   1590 MHz core improved from 30.93 TG / 124.03 PP at 800 MHz HBM to **33.18 TG / 124.64 PP
+   at 900 MHz HBM**: +7.3% decode, +0.5% prompt, with byte-identical greedy output and no
+   AMDGPU errors. The checker supplies Vega's required unchanged 950 mV memory-voltage field
+   and re-pins core state 7 plus memory state 3 after every OD commit; without that re-pin,
+   the driver silently resets core DPM and invalidates the A/B. It always restores 800 MHz.
+   All seven cards report Samsung `61AB1A9C`; keep the different 945/1000 MHz Vega 64 BIOS
+   card 7 excluded. A guarded 950 MHz clock step is now justified before any Eliovp
+   `amdmemtweak` straps. **HBM2 has no ECC here: byte-verify output after every step.**
 2. **GDN/SSM ops: PROFILED, LOW VALUE.** Direct GATED_DELTA_NET + SSM_CONV total 1.04 ms/token
    across all three devices (4.0% of GPU-op time, 2.9% wall). The profiler requires pipeline
    to be disabled via an unmatched tensor override; both normal and concurrent logger modes

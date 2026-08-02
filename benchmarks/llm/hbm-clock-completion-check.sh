@@ -10,8 +10,12 @@ mclk=${MCLK:-900}
 set_mclk() {
     local mhz=$1 card
     for card in 1 2 3; do
-        printf 'm 3 %s\n' "${mhz}" > "/sys/class/drm/card${card}/device/pp_od_clk_voltage"
+        # Vega's OD parser requires the memory voltage even when it is unchanged.
+        printf 'm 3 %s 950\n' "${mhz}" > "/sys/class/drm/card${card}/device/pp_od_clk_voltage"
         printf 'c\n' > "/sys/class/drm/card${card}/device/pp_od_clk_voltage"
+        # Committing an OD table resets the DPM selections on this driver.
+        printf '7\n' > "/sys/class/drm/card${card}/device/pp_dpm_sclk"
+        printf '3\n' > "/sys/class/drm/card${card}/device/pp_dpm_mclk"
     done
     sleep 3
     for card in 1 2 3; do

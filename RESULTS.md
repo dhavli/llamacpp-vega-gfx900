@@ -364,3 +364,25 @@ Refuted by measurement, not argument:
    anything under 5%.
 4. The RADV dump interleaves backend IR with final ISA; only ISA lines carry a `; hexcode`
    suffix. Counting IR as ISA reports max VGPR 4 — obvious nonsense, easy to believe.
+
+## 5g. HBM overdrive validation (2026-08-02)
+
+The rig now boots with `amdgpu.ppfeaturemask=0xffffffff`; the previous persistent GRUB
+source and both generated configs have timestamped backups on the rig. On cards 1–3, with
+core and memory DPM states explicitly pinned after each OD commit:
+
+| HBM clock | prompt eval | decode | deterministic output |
+|---|---:|---:|---|
+| 800 MHz | 124.03 t/s | 30.93 t/s | oracle |
+| 900 MHz | 124.64 t/s | **33.18 t/s** | byte-identical |
+
+That is +0.5% prompt and **+7.3% decode**, without new AMDGPU errors. This establishes HBM
+clock as a real decode lever despite the earlier cross-card Vega 64 comparison failing to
+show it; that comparison also changed BIOS/core characteristics and was not a controlled
+memory-clock A/B.
+
+Two harness details are mandatory on this Vega driver. `pp_od_clk_voltage` requires the
+unchanged 950 mV field (`m 3 <MHz> 950`), and committing the table silently resets DPM
+selection. The checker therefore re-pins SCLK state 7 and MCLK state 3 after every commit,
+including its cleanup back to 800 MHz. The first run without that re-pin produced an invalid
+apparent regression (30.13 → 17.51 t/s at core state 0); it is excluded from the result.
