@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Production-shape llama-server probe: four 128k slots on four cards, with
+# four simultaneous 5.6k-token prompts and 128-token deterministic generations.
+set -euo pipefail
+
+runtime=${RUNTIME:-/nix/store/scb4cmx0h15sfbrapkjyx0r5jrzv8gpi-vega-runtime}
+model=${MODEL:-/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}
+prompt_file=${PROMPT:-/root/bonsai/prompt8k.txt}
+port=${PORT:-8089}
+label=${LABEL:-server-4x128k}
+graphics_queue=${GRAPHICS_QUEUE:-0}
+
+while pgrep -f '[c]oldcard-finder' >/dev/null; do
+    echo 'coldcard-finder owns the GPUs; waiting'
+    sleep 60
+done
+
+server_env=(RADV_PERFTEST=nogttspill)
+if [[ ${graphics_queue} == 1 ]]; then
+    server_env=(GGML_VK_ALLOW_GRAPHICS_QUEUE=1)
+fi
+
+env "${server_env[@]}" \
+GGML_VK_VISIBLE_DEVICES=0,1,2,3 LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
+    "${runtime}/bin/llama-server" -m "${model}" -ngl 99 -fa on --no-mmap \
+    -ctk q8_0 -ctv q8_0 -c $((4 * 131072)) -np 4 \
+    --cache-ram 0 --ctx-checkpoints 0 \
+    --host 127.0.0.1 --port "${port}" > "/tmp/${label}.server.log" 2>&1 &
+server_pid=$!
+trap 'kill "${server_pid}" 2>/dev/null || true; wait "${server_pid}" 2>/dev/null || true' EXIT
+
+ready=0
+for _ in $(seq 1 240); do
+    if curl --silent --max-time 2 "http://127.0.0.1:${port}/health" | grep -q ok; then
+        ready=1
+        break
+    fi
+    kill -0 "${server_pid}" 2>/dev/null || break
+    sleep 5
+done
+[[ ${ready} -eq 1 ]]
+
+body=$(jq -nc --rawfile p "${prompt_file}" \
+    '{prompt:$p,n_predict:128,temperature:0,ignore_eos:true,cache_prompt:false}')
+request_pids=()
+for slot in 1 2 3 4; do
+    curl --fail --silent --show-error --max-time 1800 \
+        -X POST "http://127.0.0.1:${port}/v1/completions" \
+        -H 'Content-Type: application/json' -d "${body}" \
+        > "/tmp/${label}.slot${slot}.json" &
+    request_pids+=("$!")
+done
+for request_pid in "${request_pids[@]}"; do
+    wait "${request_pid}"
+done
+
+for slot in 1 2 3 4; do
+    jq -c --argjson slot "${slot}" \
+        '{slot:$slot,prompt_tokens:.usage.prompt_tokens,generated_tokens:.usage.completion_tokens,
+          pp_tps:.timings.prompt_per_second,tg_tps:.timings.predicted_per_second}' \
+        "/tmp/${label}.slot${slot}.json"
+done
+echo '### SERVER4X128KDONE'

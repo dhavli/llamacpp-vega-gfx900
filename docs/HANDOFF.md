@@ -48,7 +48,8 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   experimental gate (PPL +0.30%, three complete tasks quality-equivalent).
 - A server-only 8.6× decode regression was found and fixed behind
   `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1`: 3.77 → 29.70 TG, identical text. The new runtime is
-  deployed. Next: validate this env at the actual 4×128k pod-A serving shape.
+  deployed. The actual 4×128k pod-A server shape also loads and runs four requests, but
+  per-stream PP/TG falls below the explicit floor under concurrency; see below.
 
 ## Confirmed results (all output-verified; ledger has full records)
 
@@ -64,6 +65,7 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 | `GGML_VK_ASYNC_USE_TRANSFER_QUEUE=1` | +2% alone; combo gtt+tq (30.3) < gtt alone (31.7) — tq slightly hurts when stacked |
 | `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` | +4% TG alone |
 | `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` | server 3.77 → 29.70 TG (7.9×), short PP 22.8 → 134.2; restores parity with completion (32.47 TG) |
+| Real server 4×128k concurrency | all four requests complete, but streams get only 130-492 PP / 3.4-13.0 TG; serialize to one active request/pod for the ≥500/25 SLA |
 | `-b 4096 -ub 256` | PP 449 vs 519 base — smaller ubatch hurts; `-ub 1024` run produced no output (check `/tmp/qa-ub1024.log` for the failure mode) |
 | Perplexity runs OOM the box | 248320 vocab × batch × 4 B logits buffer. Default 2048 (2 GB) and even `-b 512` (508 MB) OOM-kill this host. **Always use `--no-mmap -b 128`**; P4 completed with ~0.9 GB minimum available RAM. |
 | PCIe survey | all 7 cards Gen2 x1; decode traffic ~4 KB/tok/boundary (fine), prefill ~MB/ubatch/boundary (why MoE prefill decays with card count) |
@@ -99,8 +101,8 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
 
 ### In-flight / next in queue
 - Production-shape A/B of graphics queue alone versus conservative nogttspill stacks; the
-  34.87 TG winner is single-stream at 8k, not yet a 4×128k serving measurement. Include
-  `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1`, now mandatory for server parity.
+  real 4×128k A/B is now complete: graphics changes total wall time only 53.29 → 52.60 s.
+  Next serving gate is the post-16GB two-pod run with one admitted request per pod.
 
 ### Untried — ordered by expected value/effort (from the research pass + local analysis)
 1. **HBM2 memory clock + timing straps** (decode lever, mining-proven on these exact cards):

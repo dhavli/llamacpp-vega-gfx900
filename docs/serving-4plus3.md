@@ -46,6 +46,12 @@ Front with any OpenAI-compatible balancer (nginx `least_conn` across :8080/:8081
 Route long-context/batch work to pod A, latency-sensitive single streams to pod B
 (3-card pod has the best single-stream prefill: 565-675 t/s).
 
+If the **500 PP / 25 TG per-stream floor** is an SLA, the balancer must admit at most one
+active generation per pod. Four simultaneous requests on pod A completed, but individual
+streams measured only 130-492 PP and 3.4-13.0 TG because they share one compute pipeline.
+The four slots are context-capacity slots, not four independent ≥25 TG engines. Queue excess
+work or run it in best-effort capacity mode; two pods provide two concurrent SLA streams.
+
 ## RAM-minimal rules
 
 - Keep default mmap (do NOT use `--no-mmap` in serving): weight pages are read-only,
@@ -66,6 +72,9 @@ Route long-context/batch work to pod A, latency-sensitive single streams to pod 
   `GGML_VK_TILE_M` value for this Qwen Q4_K model: although it appeared 19% faster and kept
   a long greedy prefix, perplexity exploded from 131.03 to 3.58 million.
 - Decode: pod A 52 t/s aggregate at 4 active streams (32 solo); pod B 31 solo.
+- The 52 t/s batched-bench figure is aggregate, not per-stream. A real four-request server
+  run produced 3.4-13.0 TG per stream depending on scheduler interleaving. Solo mode is the
+  only measured configuration that meets ≥25 TG per active stream.
 - Single-stream decode tuning: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` is the measured winner
   (29.44 → 34.87 t/s, byte-identical output). It does **not** stack additively with the
   conservative `RADV_PERFTEST=nogttspill` policy: graphics + nogttspill gives 32.08 t/s,
@@ -77,5 +86,8 @@ Route long-context/batch work to pod A, latency-sensitive single streams to pod 
   improves the 5.6k-prompt probe to 559 PP / 31.1 TG. PPL changed only 131.03 → 131.42 and
   three deterministic tasks remained correct, but this is still a narrow evaluation;
   top-8 remains the production default.
+- At the exact 4×128k allocation, graphics queue changed four-request wall time only
+  53.29 → 52.60 seconds (~1%). Keep the conservative `nogttspill` launch default; the
+  graphics-queue solo win is not a meaningful mixed-concurrency win.
 - MTP self-speculation is **not** a pending multiplier on this rig: it was 7.6× slower at
   79% acceptance because every draft step pays device-to-host traffic over Gen2 x1.
