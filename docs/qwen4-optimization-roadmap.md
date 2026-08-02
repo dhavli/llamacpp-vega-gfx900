@@ -63,10 +63,14 @@ Hard configuration findings:
    decode graphs per card, but same-binary ON/OFF measured 559.38/33.81 versus 559.23/35.46 and
    the replayed output diverged into repeated multilingual garbage. The full series was removed.
    Do not retry without first fixing its stale/dynamic graph-state correctness model.
-5. **Next:** isolate the post-26.1.5 ACO single-wave workgroup-barrier elimination plus its
-   correctness follow-up. It applies to gfx900 wave64 and can remove barriers in 32/64-thread
-   decode kernels; compare generated ISA before spending the full workload gate.
-6. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
+5. **Completed / rejected:** the post-26.1.5 ACO single-wave workgroup-barrier elimination plus
+   its required correctness fix was built as an isolated Mesa 26.1.5 runtime. Output remained
+   byte-identical, but performance collapsed from 559.23/35.46 to 511.27/31.31 PP/TG. The Mesa
+   override was removed.
+6. **Next:** test the gfx9-applicable RADV thread-ID/shuffle optimization series through
+   `f44a6b57`; exclude its later gfx10-only permutation tail. Require ISA evidence or a real
+   throughput signal before retaining the broad compiler backport.
+7. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
    experimental Vulkan AllReduce. Do not attempt it on the current 3.8 GB host.
 
 ## Upstream audit conclusions

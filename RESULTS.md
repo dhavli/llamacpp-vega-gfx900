@@ -473,3 +473,10 @@ correctness. The same binary measured 559.23 PP / 35.46 TG with reuse off and 55
 reuse on (TG -4.7%). More importantly, deterministic output diverged after replay into repeated
 multilingual garbage. The full graph-reuse series was removed without further PPL/server gates;
 output corruption is already a decisive rejection.
+
+The first isolated Mesa/ACO candidate was also rejected. Backporting the single-wave workgroup
+barrier elimination (`49fb361c`) together with the required `a116cc91` execution-scope fix built
+cleanly as a separate Mesa 26.1.5 runtime and retained byte-identical output. It nevertheless
+regressed the production workload from 559.23 PP / 35.46 TG to 511.27 / 31.31: -8.6% PP and
+-11.7% TG. The isolated Mesa target and patch were removed. On this shader mix, demoting/removing
+those barriers is actively harmful rather than a small scheduling win.
