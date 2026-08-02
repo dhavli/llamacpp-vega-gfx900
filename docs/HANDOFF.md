@@ -24,7 +24,8 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   7× Vega 56 on **PCIe Gen2 x1 risers (~0.5 GB/s)** — verified; ignore sysfs/lspci GPU-endpoint
   link readings (they show the on-die bridge; truth is `pp_dpm_pcie`).
 - Runtime (current, b9599 + our patch):
-  `/nix/store/0rlr67bjyf76wfzf1mmzgq73pk22fk5x-vega-runtime` (older b9596:
+  `/nix/store/scb4cmx0h15sfbrapkjyx0r5jrzv8gpi-vega-runtime` (pre-server-fix b9599:
+  `0rlr67bjyf76wfzf1mmzgq73pk22fk5x`; older b9596:
   `1fwyjlxqfl4mdbb8sas40lmhwrrvrwdn`). Models in `/root/models/`, work dir `/root/bonsai/`.
 - Build box = this container: edit `flake.nix` (pin FULL 40-char revs; GitHub API is
   rate-limited), `nix build .#vega-runtime -o result-runtime`, ship with
@@ -43,9 +44,11 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   active. Logs: `/root/bonsai/{recover2,followup,ppl-tile-ab}.log`.
 - Pipeline parallelism is enabled. The env stacks are non-additive. The Qwen TILE_M candidate
   is falsified by perplexity. These results are recorded in `benchmarks/llm/index.jsonl`.
-- `ppl-expert-ab.sh` is now running the `expert_used_count=6` quality A/B against normal
-  top-8 using `--no-mmap -b 128`; log `/root/bonsai/ppl-expert-ab.log`, sentinel `### P5DONE`.
-  If perplexity remains close, follow with several fixed task prompts.
+- The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
+  experimental gate (PPL +0.30%, three complete tasks quality-equivalent).
+- A server-only 8.6× decode regression was found and fixed behind
+  `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1`: 3.77 → 29.70 TG, identical text. The new runtime is
+  deployed. Next: validate this env at the actual 4×128k pod-A serving shape.
 
 ## Confirmed results (all output-verified; ledger has full records)
 
@@ -60,6 +63,7 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 | `RADV_PERFTEST=nogttspill` | TG 29.44 → 31.72 (+8%), PP unchanged |
 | `GGML_VK_ASYNC_USE_TRANSFER_QUEUE=1` | +2% alone; combo gtt+tq (30.3) < gtt alone (31.7) — tq slightly hurts when stacked |
 | `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` | +4% TG alone |
+| `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` | server 3.77 → 29.70 TG (7.9×), short PP 22.8 → 134.2; restores parity with completion (32.47 TG) |
 | `-b 4096 -ub 256` | PP 449 vs 519 base — smaller ubatch hurts; `-ub 1024` run produced no output (check `/tmp/qa-ub1024.log` for the failure mode) |
 | Perplexity runs OOM the box | 248320 vocab × batch × 4 B logits buffer. Default 2048 (2 GB) and even `-b 512` (508 MB) OOM-kill this host. **Always use `--no-mmap -b 128`**; P4 completed with ~0.9 GB minimum available RAM. |
 | PCIe survey | all 7 cards Gen2 x1; decode traffic ~4 KB/tok/boundary (fine), prefill ~MB/ubatch/boundary (why MoE prefill decays with card count) |
@@ -82,17 +86,21 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
 3. **Stacked combos: confirmed non-additive.** gfx+gtt = 32.08 TG; adding transfer queue =
    33.78, both byte-identical but below graphics queue alone at 34.87. Use `nogttspill` as a
    conservative fit/fail policy, not as the peak-throughput configuration.
-4. **`expert_used_count=6`**: 559.1 PP / 31.13 TG versus 519.69 / 29.44 control
-   (+7.6% / +5.7%); output is coherent but differs by design. It needs a REAL quality eval
-   (ppl A/B with `--no-mmap -b 128` + task prompts) before entering the blueprint.
+4. **`expert_used_count=6`: EXPERIMENTAL PASS.** 559.1 PP / 31.13 TG versus 519.69 / 29.44
+   control (+7.6% / +5.7%). PPL is 131.422 vs 131.033 (+0.30%, inside error); both configs
+   correctly answered the rate, Python mutable-default, and HTTP PUT tasks. The prime task
+   truncated in both and was excluded. Expose top-6 as optional, keep top-8 as default.
+5. **llama-server graph reservation: FIXED.** Server forces `n_outputs_max=n_parallel`, which
+   made one-slot Qwen decode 3.77 TG while identical `llama-completion` reached 32.47.
+   `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` restores 29.70 TG and identical text. Disabling
+   checkpoints/cache did not move TG. Export the env for every serving pod.
 
 ## PP/TG improvement paths — tried, in-flight, and UNTRIED
 
 ### In-flight / next in queue
-- expert_used_count 6/7 quality tradeoff; the measured gain is only +6-8%, not linear in
-  expert count. Use low-RAM perplexity and task prompts before considering it deployable.
 - Production-shape A/B of graphics queue alone versus conservative nogttspill stacks; the
-  34.87 TG winner is single-stream at 8k, not yet a 4×128k serving measurement.
+  34.87 TG winner is single-stream at 8k, not yet a 4×128k serving measurement. Include
+  `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1`, now mandatory for server parity.
 
 ### Untried — ordered by expected value/effort (from the research pass + local analysis)
 1. **HBM2 memory clock + timing straps** (decode lever, mining-proven on these exact cards):

@@ -27,15 +27,19 @@ Total: 5-6 streams at 128k-class context ≥ the 4×128k / 512k goal.
 ```bash
 # Pod A - 4 cards
 GGML_VK_VISIBLE_DEVICES=0,1,2,3 RADV_PERFTEST=nogttspill \
+LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
   vega-runtime/bin/llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   -ngl 99 -fa on -ctk q8_0 -ctv q8_0 \
-  -c $((4*131072)) -np 4 --host 0.0.0.0 --port 8080
+  -c $((4*131072)) -np 4 --cache-ram 0 --ctx-checkpoints 0 \
+  --host 0.0.0.0 --port 8080
 
 # Pod B - 3 cards
 GGML_VK_VISIBLE_DEVICES=4,5,6 RADV_PERFTEST=nogttspill \
+LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
   vega-runtime/bin/llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   -ngl 99 -fa on -ctk q8_0 -ctv q8_0 \
-  -c 131072 -np 1 --host 0.0.0.0 --port 8081
+  -c 131072 -np 1 --cache-ram 0 --ctx-checkpoints 0 \
+  --host 0.0.0.0 --port 8081
 ```
 
 Front with any OpenAI-compatible balancer (nginx `least_conn` across :8080/:8081).
@@ -51,6 +55,10 @@ Route long-context/batch work to pod A, latency-sensitive single streams to pod 
   pod: ~5 GiB total on a 16 GB box, rest = page cache (makes restarts ~4× faster).
 - Never any CPU offload: `-ngl 99` and no `--override-tensor` (tensor overrides also
   silently disable pipeline parallelism).
+- `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` is mandatory with this runtime. Without it, server's
+  one-slot graph reservation decodes at 3.77 t/s; with it, the same request reaches 29.70,
+  near `llama-completion` at 32.47. `--cache-ram 0 --ctx-checkpoints 0` avoids accumulating
+  ~129 MiB prompt entries and ~62.8 MiB recurrent checkpoints on the RAM-minimal setup.
 
 ## Expected numbers (from measured baselines, b9599 + patch)
 
@@ -65,7 +73,9 @@ Route long-context/batch work to pod A, latency-sensitive single streams to pod 
   commands so an over-capacity configuration fails instead of silently paging weights over
   Gen2 x1; use graphics-queue alone only after the exact production slot/context allocation
   is proven to fit.
-- `expert_used_count` 8→6 improves the 5.6k-prompt probe to 559 PP / 31.1 TG, but changes
-  model semantics and remains experimental until perplexity and task-quality evaluation.
+- Optional quality/speed tradeoff: `--override-kv qwen35moe.expert_used_count=int:6`
+  improves the 5.6k-prompt probe to 559 PP / 31.1 TG. PPL changed only 131.03 → 131.42 and
+  three deterministic tasks remained correct, but this is still a narrow evaluation;
+  top-8 remains the production default.
 - MTP self-speculation is **not** a pending multiplier on this rig: it was 7.6× slower at
   79% acceptance because every draft step pays device-to-host traffic over Gen2 x1.

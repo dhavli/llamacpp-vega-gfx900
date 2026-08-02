@@ -50,6 +50,18 @@ The tempting Q4_K prefill override
 perplexity is **3,583,951 vs 131.03** for the default tile. Tile correctness is kernel-path
 specific: this value remains verified for Bonsai Q1_0, but must not be exported for Qwen.
 
+For `llama-server`, export **`LLAMA_SERVER_FULL_OUTPUT_RESERVE=1`**. Prism b9599 otherwise
+sets `n_outputs_max=n_parallel` (1 for a single slot), and the resulting graph reservation
+collapses this hybrid model to **3.77 t/s**. Reserving the full batch, as
+`llama-completion` does, restores **29.70 t/s** and raises short-prompt PP from 22.8 to 134.2,
+with identical text. Disabling server context checkpoints and its prompt cache did not change
+decode, so they were not the cause. The override is carried by this repo's patch.
+
+Reducing routed experts from top-8 to top-6 is a viable experimental quality/speed option:
+PPL is 131.42 vs 131.03 (a 0.30% delta, inside error), three deterministic tasks are
+quality-equivalent, and the long-prompt probe improves from 519.7/29.4 to 559.1/31.1 PP/TG.
+This narrow evaluation does not establish broad no-loss quality, so top-8 remains the default.
+
 Note the direction: MoE prefill gets **worse** with more cards (641 → 561 → 506 at pp2048),
 the opposite of the dense model, which *gained* from 3 cards at long prompts. A3B does roughly
 a ninth of the matmul per token, so per-stage work is small relative to the fixed per-boundary
