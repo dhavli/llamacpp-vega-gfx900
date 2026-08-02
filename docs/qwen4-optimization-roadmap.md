@@ -58,10 +58,15 @@ Hard configuration findings:
    549.02 PP. A subgroup-ballot refinement was also byte-identical and recovered 559.22 PP,
    only +0.14% over the 558.42 traced control. The patch and its ~4 MiB/card ubatch scratch were
    removed because they do not clear the adoption threshold.
-4. **Next:** test Vulkan command-buffer graph reuse from upstream PR #24720 behind an opt-in build.
-   The 2-core Celeron makes submission overhead plausible, but upstream reports no measured
-   gain; require at least 2% TG plus multi-turn server correctness.
-5. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
+4. **Completed / rejected:** upstream PR #24720 command-buffer graph reuse was ported default-off
+   with lifecycle counters and unsafe timed eviction removed. It captured twice and replayed 123
+   decode graphs per card, but same-binary ON/OFF measured 559.38/33.81 versus 559.23/35.46 and
+   the replayed output diverged into repeated multilingual garbage. The full series was removed.
+   Do not retry without first fixing its stale/dynamic graph-state correctness model.
+5. **Next:** isolate the post-26.1.5 ACO single-wave workgroup-barrier elimination plus its
+   correctness follow-up. It applies to gfx900 wave64 and can remove barriers in 32/64-thread
+   decode kernels; compare generated ISA before spending the full workload gate.
+6. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
    experimental Vulkan AllReduce. Do not attempt it on the current 3.8 GB host.
 
 ## Upstream audit conclusions

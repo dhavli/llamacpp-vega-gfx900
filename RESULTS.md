@@ -464,3 +464,12 @@ already used by the production MM-ID shader restored 559.22 PP with identical ou
 only +0.14% over the 558.42 shape-trace control and does not clear noise or the 2% adoption gate.
 The candidate and its roughly 4 MiB/card per-ubatch scratch allocation were removed. Repeated
 routing scans are therefore not a material four-card bottleneck on this workload.
+
+Upstream PR #24720's Vulkan command-buffer cache was then ported behind
+`GGML_VK_GRAPH_REUSE=1`, with its unsafe timed eviction removed and aggregate lifecycle counters
+added. The mechanism did activate: every card recorded 13 warmups, two captures, 123 replays,
+and one invalidation during the 128-token workload. It nevertheless failed both performance and
+correctness. The same binary measured 559.23 PP / 35.46 TG with reuse off and 559.38 / 33.81 with
+reuse on (TG -4.7%). More importantly, deterministic output diverged after replay into repeated
+multilingual garbage. The full graph-reuse series was removed without further PPL/server gates;
+output corruption is already a decisive rejection.
