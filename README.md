@@ -16,6 +16,29 @@ measured on that machine.
 > prefill ceiling is not usable for this deployment and it is no longer an active hosting or
 > optimization target.
 
+### Gemma 4 26B-A4B single-pod result
+
+`unsloth/gemma-4-26B-A4B-it-qat-GGUF` at UD-Q4_K_XL (14.249 GB) runs text-only with
+a full **128K q8 KV** allocation on two 8 GB Vega cards. The balanced server profile is:
+
+```bash
+GGML_VK_VISIBLE_DEVICES=0,1 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+RADV_PERFTEST=nogttspill LLAMA_SERVER_OUTPUT_RESERVE=128 \
+llama-server -m gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf \
+  -ngl 99 -fa on --no-mmap -c 131072 -np 1 -ctk q8_0 -ctv q8_0 \
+  -b 1408 -ub 384 --cache-ram 0 --ctx-checkpoints 0
+```
+
+On the 5,511-token prompt plus 128 generated tokens, two repeats reached
+**721.01/24.24 and 720.76/25.35 PP/TG** (720.88/24.79 average), with identical output.
+This is +21.5% PP with flat decode versus the initial b512/ub256 server control at
+593.55/24.69. Ubatch 448 is pathological (105.44/2.32), while b1536/ub384 is a
+prefill-only 732.47/19.75 tradeoff. q4 KV makes b2048 fit but is slower at 600.76/24.39.
+
+The shipped 252 MB MTP drafter does not fit this two-card 128K profile. A diagnostic
+three-card run reaches 85.96% acceptance but collapses to **378.01 PP / 5.19 TG** because
+draft calls cross the Gen2 x1 links. Do not enable MTP on this rig.
+
 **Qwen3.6-35B-A3B at UD-Q4_K_XL** (21.27 GiB, 256 experts / top-8, 3B active,
 30 gated-delta-net + 10 full-attention layers), split across multiple cards:
 

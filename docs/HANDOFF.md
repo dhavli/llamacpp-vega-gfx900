@@ -4,6 +4,23 @@ Context for the next agent picking up this work. Read this top to bottom before 
 the rig. The prior session log lives in the repo history and `benchmarks/llm/index.jsonl`
 (one JSON record per experiment, including falsifications — treat it as the source of truth).
 
+## Gemma 4 26B-A4B single-pod pivot (2026-08-03)
+
+- The Unsloth UD-Q4_K_XL target and MTP drafter SHA-256 values match Hugging Face
+  (`a7c5bc...f5891` target, `7272d9...f768a` drafter).
+- One text-only 2-GPU pod allocates 128K context with q8 K/V under `nogttspill`. The frozen
+  balanced launch is b1408/ub384, output reserve 128, graphics queue, global lock, no mmap,
+  cache RAM 0, and context checkpoints 0. Repeats: 721.01/24.24 and 720.76/25.35 PP/TG.
+- Cache/checkpoint disablement is the largest measured server lever: b1024/ub384 moves from
+  626.04/25.24 to 670.81/25.28. The b1408 refinement raises average PP to 720.88.
+- Boundaries: ub448 collapses to 105.44/2.32; b1536/ub384 trades to 732.47/19.75;
+  b2048/ub512 q8 is host-OOM-killed; q4 KV permits it but is slower at 600.76/24.39.
+- MTP is rejected. It cannot initialize at 2 GPUs/128K. On three GPUs it fits and accepts
+  85.96% of draft tokens, yet reaches only 378.01/5.19 due to x1-riser draft overhead.
+- Per the operator, do not continue multi-pod testing until host RAM is upgraded. Focus any
+  follow-up on one two-card pod. Reproduction harness:
+  `benchmarks/llm/gemma4-2gpu-128k-probe.sh`.
+
 ## Mission and the user's explicit targets
 
 - Serve **Qwen3.6-35B-A3B-UD-Q4_K_XL** (21.27 GiB MoE, 256 experts top-8, arch `qwen35moe`)
