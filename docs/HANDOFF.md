@@ -71,6 +71,7 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   551.76/25.78, but top-6 repeatedly reaches 573.16/29.03 and 571.35/27.58, with identical
   same-tier output. Use top-6 as the opt-in high-throughput four-slot tier; retain top-8 as
   the trained-routing default.
+  Adding per-device queue locks to top-6 is neutral at 571.27/28.32, so keep the global lock.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
