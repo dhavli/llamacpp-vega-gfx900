@@ -50,10 +50,11 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   active. Logs: `/root/bonsai/{recover2,followup,ppl-tile-ab}.log`.
 - Pipeline parallelism is enabled. The env stacks are non-additive. The Qwen TILE_M candidate
   is falsified by perplexity. These results are recorded in `benchmarks/llm/index.jsonl`.
-- New best four-card top-8 shallow profile: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` plus
-  `-ts 0.85,1.05,1.05,1.05` reaches **559.74 PP / 35.56 TG** on the real 5,629-token prompt,
-  versus 528.72 / 30.65 default, byte-identical. Preserve device order `0,1,2,3`; reversing
-  it collapses to 88.55 / 2.81. See `docs/qwen4-optimization-roadmap.md`.
+- Best four-card top-8 shallow profile: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` plus
+  `-ts 0.85,1.05,1.05,1.05 -b 2048 -ub 768` reaches **583.34–584.80 PP / 34.93–35.64 TG**
+  on the real 5,629-token prompt. Streaming PPL is 131.2037 versus 131.0328 control, and the
+  fail-closed residency gate passed. Preserve device order `0,1,2,3`; reversing it collapses
+  to 88.55 / 2.81. See `docs/qwen4-optimization-roadmap.md`.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
@@ -111,15 +112,15 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` restores 29.70 TG and identical text. Disabling
    checkpoints/cache did not move TG. Export the env for every serving pod.
 
-## PP/TG improvement paths — tried, in-flight, and UNTRIED
+## PP/TG improvement paths — resolved or hardware-blocked
 
-### In-flight / next in queue
+### Current-hardware closure / next hardware gate
 - The four-card shallow-context optimization list is exhausted through copy overlap, upstream and
   Mesa compiler candidates, routed-MM geometry, discrete split neighbors, and ubatch refinement.
-  Ubatch 640 is the latest adopted win; see `docs/qwen4-optimization-roadmap.md`. The next serving
+  Batch 2048 / ubatch 768 is the latest adopted win; see `docs/qwen4-optimization-roadmap.md`. The next serving
   gate remains the post-16GB two-pod run with one admitted request per pod.
 
-### Untried — ordered by expected value/effort (from the research pass + local analysis)
+### Resolved findings and post-upgrade work
 1. **HBM2 memory clock: PROVEN DECODE LEVER.** The rig now boots with
    `amdgpu.ppfeaturemask=0xffffffff` (the former `0xffff7fff` source and both generated GRUB
    configs are backed up with suffix `.20260802-codex-ppfeaturemask.bak`). Cards 1–3 at

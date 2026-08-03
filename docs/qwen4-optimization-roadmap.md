@@ -12,7 +12,7 @@ LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
   vega-runtime/bin/llama-server \
   -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   -ngl 99 -fa on -ts 0.85,1.05,1.05,1.05 \
-  -ctk q8_0 -ctv q8_0 -b 2048 -ub 640 \
+  -ctk q8_0 -ctv q8_0 -b 2048 -ub 768 \
   --cache-ram 0 --ctx-checkpoints 0
 ```
 
@@ -32,14 +32,17 @@ gain. Top-6 remains an experimental quality/speed tier, not the production defau
 Hard configuration findings:
 
 - Preserve forward device order. Reversing it produced only 88.55 PP / 2.81 TG.
-- Use `-ub 640` for this four-card shallow-context profile. A repeated same-runtime pair measured
-  571.09/33.53 versus ub512's 558.67/32.43 PP/TG (+2.22%/+3.39%), while a separate run reached
-  576.55/35.51. Streaming PPL was 130.9594 versus 131.0328 control. Ubatch 384 lost, 576 was
-  mixed, and 1024 remained pathological.
+- Use `-b 2048 -ub 768` for this four-card shallow-context profile. Repeated runs measured
+  583.34–584.80 PP and 34.93–35.64 TG, with deterministic output. Streaming PPL was 131.2037
+  versus 131.0328 control. Ubatch 704 was slightly slower; 832, 896, and 1024 were pathological.
+  Ubatch 704's 582.13/35.59 and 13.467-second total was a noise-level Pareto tradeoff, not a
+  >=2% win. The aligned `-b2304 -ub768` pair regressed TG to 32.66, worsened total time to
+  13.746 seconds, and changed the output hash, so keep batch 2048.
 - Keep stock 1590 MHz core and 800 MHz HBM for four-card serving. HBM 900 changed PP/TG by
   only +0.36%/+0.36% on the default queue, and under graphics queue changed +0.5%/-1.8%.
-- Do not combine the peak profile with `RADV_PERFTEST=nogttspill` until the exact allocation
-  has passed a fit gate; that conservative policy reduces the graphics-queue solo win.
+- `RADV_PERFTEST=nogttspill` is optional diagnostic hardening, not a production speed knob. The
+  exact peak profile passed it at 585.54 PP / 34.69 TG with 42/42 layers offloaded, no evictions,
+  invalidations, or GPU faults; its performance effect is neutral.
 
 ## Ranked implementation work
 
@@ -90,11 +93,12 @@ Hard configuration findings:
    Valid BN128 and BM128 geometries regressed to 462.18 and 406.14 PP. A 128-thread/BM32 tile
    reached 626.14 PP but diverged and produced PPL 248,320 versus 131.03 control. The knob was
    removed; the apparent win was invalid work partitioning.
-10. **Completed / adopted:** the bounded ubatch bracket found 640 as a quality-safe win. The
-    same-runtime pair improved PP/TG 558.67/32.43 -> 571.09/33.53, and a second candidate run
-    reached 576.55/35.51. A streaming low-memory PPL gate measured 130.9594 versus 131.0328
-    control. The final `nogttspill` run offloaded 42/42 layers with no evicted/invalidated BOs
-    or GPU faults. Ubatch 640 replaces 512 in the shallow-context profile.
+10. **Completed / adopted:** the bounded upper ubatch bracket found 768 as the quality-safe
+    optimum. Repeats measured 583.34–584.80 PP and 34.93–35.64 TG; streaming PPL measured
+    131.2037 versus 131.0328 control. Ubatch 704 was lower, while 832/896 crossed the pathological
+    cliff. Batch sweeps at 2560 and 3200 were mixed or worse, and aligned b2304/ub768 regressed
+    decode and total time. The final `nogttspill` run offloaded 42/42 layers with no eviction or
+    faults. Ubatch 768 with batch 2048 is the closed-matrix shallow-context winner.
 
 ## Upstream audit conclusions
 

@@ -219,7 +219,10 @@ Single-user Nix 2.35.1 now runs on the rig (nixbld group created; binaries symli
 and registered, no more silent truncation. The earlier rsync-shipped paths were
 re-registered by the first `nix copy`.
 
-## 6. Next steps, in priority order
+## 6. Archived Bonsai next steps (retired target)
+
+This 2026-07-30 list is preserved for provenance only. It is not an active work queue;
+Qwen3.6 sparse-MoE work superseded it.
 
 1. **Multi-GPU scaling.** 7 idle cards on x16 links. Layer-split 2–4 cards for Q2_0 (better
    quality) at 128k, and measure whether x16 changes the row-split calculus — my analysis
@@ -544,5 +547,15 @@ The repeat same-runtime pair measured 571.09/33.53 at ub640 versus 558.67/32.43 
 `RADV_PERFTEST=nogttspill` reached 575.50 PP, reproduced the ub640 output hash, offloaded 42/42
 layers, and showed zero evicted/invalidated BOs or GPU faults. Per-process DRM accounting showed
 4.5–5.7 GiB of model VRAM per active card, the expected ~535 MiB host/staging allocation only on
-the main client, and tiny ~2.4 MiB GTT allocations on downstream clients. Adopt `-ub 640` for this
-four-card shallow-context profile; keep `-b 2048`.
+the main client, and tiny ~2.4 MiB GTT allocations on downstream clients. This established ub640
+as the first adopted improvement over ub512.
+
+The final upper bracket then promoted `-b 2048 -ub 768`. Ubatch 704 measured 582.13/35.59;
+two ub768 runs measured 584.80/35.64 and 583.34/34.93, with the same deterministic output hash
+and 13.419–13.535 second totals. True-batch streaming PPL was 131.2037 +/- 5.18752 versus the
+131.0328 control. A fail-closed ub768 run reached 585.54/34.69, retained the hash, offloaded
+42/42 layers, and showed no eviction or GPU fault. Ubatch 832 and 896 both crossed the same
+pathological runtime cliff as 1024 and were terminated. Batch 2560/ub640 was neutral, while
+3200/ub640 traded higher PP for lower TG and a worse total. The final aligned b2304/ub768 probe
+reached 585.43/32.66 and 13.746 seconds with a divergent hash, so it was rejected. The bounded
+runtime matrix is exhausted; adopt `-b 2048 -ub 768`.

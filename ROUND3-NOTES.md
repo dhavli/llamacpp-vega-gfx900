@@ -1,4 +1,7 @@
-# Round-3 work notes (toward TG 30 / PP "bigger the better")
+# Archived Bonsai round-3 work notes (retired target)
+
+This file is a historical experiment ledger, not an active candidate list. Current work targets
+Qwen3.6 sparse MoE only; see `docs/qwen4-optimization-roadmap.md`.
 
 State after round 2 (commit 1e6b91f, runtime store `pk52zfmn...`): TG 18.65, pp512 141.1.
 Decode budget 53.6 ms/token = ~33 ms matvec + ~15-20 ms small-op dispatch swarm.
