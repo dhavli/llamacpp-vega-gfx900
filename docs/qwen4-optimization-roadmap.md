@@ -83,6 +83,11 @@ Hard configuration findings:
    output layer on card 3. Its six one-block neighbors were exhaustively screened. Five measured
    528.47–529.94 PP; the least-bad measured 558.47/32.83 PP/TG. All were deterministic, so the
    current allocation is a one-block local optimum.
+9. **Completed / rejected:** perf attribution showed Q4_K medium `MUL_MAT_ID` is 27.72% of
+   instrumented prefill GPU time, an unswept surface distinct from prior TILE_S/TILE_M tests.
+   Valid BN128 and BM128 geometries regressed to 462.18 and 406.14 PP. A 128-thread/BM32 tile
+   reached 626.14 PP but diverged and produced PPL 248,320 versus 131.03 control. The knob was
+   removed; the apparent win was invalid work partitioning.
 
 ## Upstream audit conclusions
 

@@ -521,3 +521,13 @@ two boundaries or from card 3 to card 2 produced only 528.47–529.94 PP. Moving
 to card 3 was the least-bad neighbor at 558.47 PP / 32.83 TG, still below the repeated center band
 around 559–561 / 35.5. Every continuation was byte-identical. The current split is therefore a
 proven one-block local optimum; continuous weight perturbations do not hide an adjacent placement.
+
+The active routed-matmul surface was finally attributed rather than inferred. With the established
+pipeline-disabled Vulkan perf logger, Q4_K `MUL_MAT_ID` consumed 2.779 of 10.027 instrumented GPU
+seconds (27.72%), so a dedicated medium-ID tile knob was justified. The prior `TILE_S` and ordinary
+`TILE_M` sweeps had never changed this pipeline. Three geometry-valid directions were tested.
+Doubling BN to 128 was byte-identical but regressed to 462.18 PP / 33.67 TG. Doubling BM to 128
+was byte-identical and fell to 406.14 PP. A two-wave 128-thread/BM32 tile appeared to win at
+626.14 PP / 35.41 TG, but diverged immediately and measured PPL 248,320.0 versus the 131.0328
+control—the vocabulary-size ceiling. It was skipping/corrupting work. The isolated knob was removed;
+the stock medium MM-ID geometry remains the only correct performant choice among the bounded set.
