@@ -15,6 +15,7 @@ use_mtp=${USE_MTP:-0}
 backend_sampling=${BACKEND_SAMPLING:-0}
 tensor_split=${TENSOR_SPLIT-}
 expert_count=${EXPERT_COUNT:-8}
+output_reserve=${OUTPUT_RESERVE:-128}
 
 server_args=(
     -m "${model}" -ngl 99 -fa on --no-mmap
@@ -39,7 +40,7 @@ fi
 
 env GGML_VK_VISIBLE_DEVICES="${devices}" \
     GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill \
-    LLAMA_SERVER_OUTPUT_RESERVE=128 \
+    LLAMA_SERVER_OUTPUT_RESERVE="${output_reserve}" \
     "${runtime}/bin/llama-server" "${server_args[@]}" \
     > "/tmp/${label}.server.log" 2>&1 &
 server_pid=$!

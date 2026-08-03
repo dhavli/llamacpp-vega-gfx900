@@ -37,10 +37,12 @@ prefill-only 732.47/19.75 tradeoff. q4 KV makes b2048 fit but is slower at 600.7
 At real depth, a 121,243-token fill plus 128-token generation completes at
 **284.89 PP / 17.74 TG**, with the same deterministic completion and no GPU faults.
 Thus 128K is operational, but shallow decode must not be extrapolated to a full context.
-For interactive or reused-context traffic, add `--backend-sampling`: two shallow runs average
-701.57/27.76 (−2.7% PP, +12.0% TG), and the 121K-depth run reaches 278.75/19.16
-(−2.2% PP, +8.0% TG). Leave it off for one-shot prefill-dominated requests; enable it when
-decode latency matters and the raw completion API is compatible with backend sampling.
+For interactive or reused-context traffic, add `--backend-sampling`, raise batch to 1536,
+and set `LLAMA_SERVER_OUTPUT_RESERVE=64`. Two shallow runs average **713.61/27.36**
+(−1.0% PP, +10.4% TG versus the conservative profile), and the 121K-depth run reaches
+**281.85/19.73** (−1.1% PP, +11.2% TG). This also dominates the earlier backend-sampling
+b1408/reserve128 tier at depth. Leave backend sampling off for one-shot prefill-dominated
+requests; use this profile when decode latency matters and the raw completion API is compatible.
 
 The shipped 252 MB MTP drafter is host-RAM-blocked on this two-card 128K profile. A diagnostic
 three-card run reaches 85.96% acceptance but collapses to **378.01 PP / 5.19 TG** because
@@ -55,6 +57,18 @@ shallow profile to 744.74/25.14 (+3.3% PP, +1.4% TG), but streaming perplexity w
 1697.93 to 1853.80 (+9.2%) on the same sample. More importantly, in two fresh task processes
 top-7 turned an otherwise correct exact-format prime answer into repeated 160-token
 over-explanation truncations. Keep top-8; the small speed gain does not clear the quality gate.
+
+The remaining Vulkan environment toggles are neutral on this profile. Two async-transfer-queue
+runs average 719.10/24.78, and two runs with host-visible VRAM disabled average 717.89/24.99;
+all completions match the control hash. Neither clears noise or the 2% adoption threshold, so
+leave both at their defaults.
+
+For multi-turn traffic, send `cache_prompt:true`. With a resident 5,511-token exact prefix,
+two fresh-process conservative-profile trials reduce the identical full request from
+12.89→8.57 seconds and 13.02→5.94 seconds (33.5–54.4%, 44.0% by average wall time), while
+reporting all 5,511 tokens reused and preserving the completion hash. The refined backend
+profile also improves 12.48→7.65 seconds (38.7%). Reused-request TG is variable and lower, so
+this is a measured TTFT/total-latency optimization, not a raw decode-throughput claim.
 
 **Qwen3.6-35B-A3B at UD-Q4_K_XL** (21.27 GiB, 256 experts / top-8, 3B active,
 30 gated-delta-net + 10 full-attention layers), split across multiple cards:

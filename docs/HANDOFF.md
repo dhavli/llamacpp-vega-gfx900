@@ -28,11 +28,14 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   689.73/24.83 versus the prior 720.88/24.79 control average; a fresh control returned
   719.85/24.68. Output was identical. The reported upstream decode gain does not transfer to
   this Q4_K_XL/b1408 shape; patch 0008 was removed.
-- Backend sampling is validated as a workload tier. Shallow repeats are 701.10/27.30 and
-  702.03/28.23 (701.57/27.76 average) versus 720.88/24.79 control: -2.7% PP, +12.0% TG.
-  At 121,243 tokens it reaches 278.75/19.16 versus 284.89/17.74: -2.2% PP, +8.0% TG.
-  Enable `--backend-sampling` for interactive/reused-context raw completions; leave it off
-  for one-shot long prefills and features incompatible with backend-side sampling.
+- Backend sampling is validated as a workload tier and its server shape has been refined.
+  Use b1536/ub384 with `LLAMA_SERVER_OUTPUT_RESERVE=64`: shallow repeats are 714.89/26.84
+  and 712.33/27.88 (713.61/27.36 average) versus 720.88/24.79 conservative control:
+  -1.0% PP, +10.4% TG. At 121,243 tokens it reaches 281.85/19.73 versus 284.89/17.74:
+  -1.1% PP, +11.2% TG, and it dominates the old b1408/reserve128 backend tier's
+  278.75/19.16. Enable this profile for interactive/reused-context raw completions; retain
+  conservative b1408/reserve128 without backend sampling for one-shot long prefills and
+  features incompatible with backend-side sampling.
 - Ubatch 400 is a mixed regression at 700.76/25.22 versus ub384's 720.88/24.79 average;
   retain ub384. An explicit `-ts 0.95,1.05` layer split is catastrophic at 204.12/0.72
   and drives host memory close to exhaustion. Keep automatic placement and do not test the
@@ -44,6 +47,18 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   answer that hit the 160-token limit; its other two errors were shared with top-8. Do not
   descend to top-6: the first reduction already fails the quality gate for a marginal gain.
   The probe and task harnesses accept configurable Gemma expert counts for reproduction.
+- The last two low-risk Vulkan environment candidates are neutral. With
+  `GGML_VK_ASYNC_USE_TRANSFER_QUEUE=1`, runs are 717.50/24.42 and 720.69/25.15
+  (719.10/24.78 average). With `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1`, runs are
+  717.25/24.59 and 718.52/25.39 (717.89/24.99 average). All outputs match the frozen hash;
+  neither clears the 2% gate versus 720.88/24.79. Keep both defaults unchanged.
+- Resident slot prefix reuse is validated for multi-turn requests. With `cache_prompt:true`,
+  two fresh-process trials reuse all 5,511 prefix tokens and reduce the full 5,521+128 request
+  from 12.89 to 8.57 seconds and 13.02 to 5.94 seconds (33.5-54.4%, 44.0% by average wall
+  time), with identical completion hashes. The b1536/reserve64 backend tier also improves
+  12.48 to 7.65 seconds (38.7%). Reused-request TG is variable and lower (16.55, 22.49,
+  and 17.57), so classify this as a TTFT/total-latency win rather than a decode-TPS win.
+  Reproduction harness: `benchmarks/llm/gemma4-prefix-cache-probe.sh`.
 
 ## Mission and the user's explicit targets
 
