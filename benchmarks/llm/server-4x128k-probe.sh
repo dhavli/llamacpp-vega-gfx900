@@ -9,6 +9,7 @@ prompt_file=${PROMPT:-/root/bonsai/prompt8k.txt}
 port=${PORT:-8089}
 label=${LABEL:-server-4x128k}
 graphics_queue=${GRAPHICS_QUEUE:-0}
+per_queue_mutex=${PER_QUEUE_MUTEX:-0}
 requests=${REQUESTS:-4}
 n_batch=${BATCH:-2048}
 n_ubatch=${UBATCH:-768}
@@ -23,6 +24,9 @@ done
 server_env=(RADV_PERFTEST=nogttspill)
 if [[ ${graphics_queue} == 1 ]]; then
     server_env+=(GGML_VK_ALLOW_GRAPHICS_QUEUE=1)
+fi
+if [[ ${per_queue_mutex} == 1 ]]; then
+    server_env+=(GGML_VK_PER_QUEUE_MUTEX=1)
 fi
 
 mmap_args=()

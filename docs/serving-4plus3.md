@@ -88,6 +88,8 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
   Gen2 x1. The exact 4x128k allocation now passes with both `nogttspill` and graphics queue,
   automatic placement, and ub512: 529.63 PP / 26.95 TG versus 529.45 / 23.41 without graphics,
   with byte-identical output. This meets the 500/25 single-admission SLA.
+  Do not add `GGML_VK_PER_QUEUE_MUTEX=1` to this long-context profile: it keeps PP flat at
+  529.66 but lowers TG to 26.02. The per-device-lock win is specific to the shallow profile.
 - Optional quality/speed tradeoff: `--override-kv qwen35moe.expert_used_count=int:6`
   improves the 5.6k-prompt probe to 559 PP / 31.1 TG. PPL changed only 131.03 → 131.42 and
   three deterministic tasks remained correct, but this is still a narrow evaluation;

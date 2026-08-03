@@ -65,6 +65,8 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   process-global mutex while preserving one shared mutex for wrappers of the same queue. Repeated
   averages improved TG 32.77 -> 34.64 with flat PP, and the fail-closed result was 583.74/35.56.
   Export `GGML_VK_PER_QUEUE_MUTEX=1` for the shallow profile.
+  It does not stack in the exact 4x128k server shape: graphics+global lock was 529.63/26.95,
+  while graphics+per-device locks measured 529.66/26.02. Keep the global lock for that launch.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
