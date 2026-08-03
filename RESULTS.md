@@ -513,3 +513,11 @@ doubled the chunks to 264, reached 568.53 PP, and worsened copy wall time again 
 nominal overlap counter rose, proving that it is not the limiting metric: additional CPU staging
 copies and fence/submission costs consume the gain. Larger chunks necessarily reduce overlap, so
 the sweep was pruned and v2 removed. A blocking per-tensor pipeline cannot clear the 2% gate.
+
+The winning split was then resolved into discrete logical layers. With 40 transformer blocks plus
+the output layer, `0.85,1.05,1.05,1.05` maps 9/11/11/10 logical layers (9/11/11/9 blocks, with
+output on card 3). All six one-block neighbors were measured. Moving a block at either of the first
+two boundaries or from card 3 to card 2 produced only 528.47–529.94 PP. Moving block 30 from card 2
+to card 3 was the least-bad neighbor at 558.47 PP / 32.83 TG, still below the repeated center band
+around 559–561 / 35.5. Every continuation was byte-identical. The current split is therefore a
+proven one-block local optimum; continuous weight perturbations do not hide an adjacent placement.

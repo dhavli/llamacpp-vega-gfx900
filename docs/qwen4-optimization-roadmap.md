@@ -79,6 +79,10 @@ Hard configuration findings:
    UUB pass affects under 1% of general shaders and is not credible without matching active IR.
 7. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
    experimental Vulkan AllReduce. Do not attempt it on the current 3.8 GB host.
+8. **Completed / retained:** the custom split maps to 9/11/11/9 transformer blocks with the
+   output layer on card 3. Its six one-block neighbors were exhaustively screened. Five measured
+   528.47–529.94 PP; the least-bad measured 558.47/32.83 PP/TG. All were deterministic, so the
+   current allocation is a one-block local optimum.
 
 ## Upstream audit conclusions
 
