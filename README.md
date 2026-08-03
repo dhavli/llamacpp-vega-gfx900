@@ -48,6 +48,9 @@ For the production-shaped server with four resident 128k slots, keep automatic l
 and `-ub 512`: the shallow custom split with ub640/768 fails the no-spill fit gate. With exactly
 one admitted request, adding the graphics queue raises **529.45 PP / 23.41 TG** to
 **529.63 PP / 26.95 TG**, byte-identically, restoring the 500/25 per-stream SLA.
+The quality-gated top-6 opt-in tier is faster still: two exact-shape runs averaged
+**572.26 PP / 28.31 TG**, with identical same-tier output. Top-7 is only a mixed
+551.76/25.78 tradeoff at this depth, so use top-6 for the high-throughput server tier.
 
 Controlled clock experiments on cards 1–3 found that 900 MHz HBM raises deterministic
 decode from 30.93 to **33.18 t/s** (+7.3%) with byte-identical output. 950 MHz did not improve
@@ -94,6 +97,7 @@ Across two fresh-process runs of eight exact/structural tasks, top-7 introduced 
 in top-8 and fixed top-8's Python alias/copy error. Top-6 reaches **629.80 PP / 33.94 TG** and
 matches top-7's task pass vector. Use top-7 for decode/latency, top-6 for prefill-heavy traffic,
 and retain top-8 when preserving the model's trained routing semantics is more important than speed.
+At four-slot 128k server shape the ranking changes: top-6 dominates both axes, while top-7 does not.
 
 Per-op Vulkan profiling also rules out the fused GDN kernels as a large decode lever. Across
 three devices, `GATED_DELTA_NET` + `SSM_CONV_SILU` total only **1.04 ms/token**—4.0% of

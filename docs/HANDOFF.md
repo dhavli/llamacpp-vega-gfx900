@@ -67,6 +67,10 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   Export `GGML_VK_PER_QUEUE_MUTEX=1` for the shallow profile.
   It does not stack in the exact 4x128k server shape: graphics+global lock was 529.63/26.95,
   while graphics+per-device locks measured 529.66/26.02. Keep the global lock for that launch.
+  Reduced-expert routing was then crossed with the exact server shape. Top-7 is mixed at
+  551.76/25.78, but top-6 repeatedly reaches 573.16/29.03 and 571.35/27.58, with identical
+  same-tier output. Use top-6 as the opt-in high-throughput four-slot tier; retain top-8 as
+  the trained-routing default.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow

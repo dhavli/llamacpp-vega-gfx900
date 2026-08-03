@@ -15,6 +15,7 @@ n_batch=${BATCH:-2048}
 n_ubatch=${UBATCH:-768}
 tensor_split=${TENSOR_SPLIT-0.85,1.05,1.05,1.05}
 use_mmap=${USE_MMAP:-1}
+expert_count=${EXPERT_COUNT:-8}
 
 while pgrep -f '[c]oldcard-finder' >/dev/null; do
     echo 'coldcard-finder owns the GPUs; waiting'
@@ -39,11 +40,17 @@ if [[ -n ${tensor_split} ]]; then
     split_args+=(-ts "${tensor_split}")
 fi
 
+expert_args=()
+if [[ ${expert_count} != 8 ]]; then
+    expert_args+=(--override-kv "qwen35moe.expert_used_count=int:${expert_count}")
+fi
+
 env "${server_env[@]}" \
 GGML_VK_VISIBLE_DEVICES=0,1,2,3 LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
     "${runtime}/bin/llama-server" -m "${model}" -ngl 99 -fa on "${mmap_args[@]}" \
     -ctk q8_0 -ctv q8_0 -c $((4 * 131072)) -np 4 \
     -b "${n_batch}" -ub "${n_ubatch}" "${split_args[@]}" \
+    "${expert_args[@]}" \
     --cache-ram 0 --ctx-checkpoints 0 \
     --host 127.0.0.1 --port "${port}" > "/tmp/${label}.server.log" 2>&1 &
 server_pid=$!

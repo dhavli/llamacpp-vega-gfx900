@@ -90,6 +90,9 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
   with byte-identical output. This meets the 500/25 single-admission SLA.
   Do not add `GGML_VK_PER_QUEUE_MUTEX=1` to this long-context profile: it keeps PP flat at
   529.66 but lowers TG to 26.02. The per-device-lock win is specific to the shallow profile.
+  For the opt-in reduced-expert service tier, top-6 is the exact-shape winner: repeated runs
+  measured 573.16/29.03 and 571.35/27.58 PP/TG (572.26/28.31 average), with deterministic
+  same-tier output. Top-7 measured 551.76/25.78 and is a mixed tradeoff here.
 - Optional quality/speed tradeoff: `--override-kv qwen35moe.expert_used_count=int:6`
   improves the 5.6k-prompt probe to 559 PP / 31.1 TG. PPL changed only 131.03 → 131.42 and
   three deterministic tasks remained correct, but this is still a narrow evaluation;
@@ -98,6 +101,8 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
   609.39 PP / 36.04 TG and PPL 132.3556 +/- 5.2767. Top-6 is prefill-biased at
   629.80 / 33.94. Both matched or exceeded top-8 on the bounded repeated eight-task suite,
   but both change trained routing semantics; expose them as explicit opt-in service tiers.
+  That top-7 preference applies to the shallow completion profile only. With four 128k slots
+  allocated, top-6 dominates top-7 and top-8 on both PP and TG.
 - At the exact 4×128k allocation, graphics queue changed four-request wall time only
   53.29 → 52.60 seconds (~1%). Keep the conservative `nogttspill` launch default; the
   graphics-queue solo win is not a meaningful mixed-concurrency win.
