@@ -31,9 +31,10 @@ doesn't ask for the FLOPs these cards can't deliver. On 3 cards a real 5629-toke
 prefills at **624 t/s** and then generates at **30.8 t/s**.
 
 The best validated four-card top-8 profile combines the graphics queue with an explicit
-layer split: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1 -ts 0.85,1.05,1.05,1.05`. On the real
-5,629-token prompt it reaches **559.74 PP / 35.56 TG**, versus 528.72 / 30.65 for the default
-queue/split, with byte-identical output. See `docs/qwen4-optimization-roadmap.md`.
+layer split and ubatch 640: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1 -ts 0.85,1.05,1.05,1.05 -ub 640`.
+On the real 5,629-token prompt, repeated ub640 runs reached **571.09–576.55 PP** while retaining
+33.53–35.51 TG; the same-runtime ub512 pair was 558.67 / 32.43. Streaming PPL is 130.9594 versus
+131.0328 control. See `docs/qwen4-optimization-roadmap.md`.
 
 Controlled clock experiments on cards 1–3 found that 900 MHz HBM raises deterministic
 decode from 30.93 to **33.18 t/s** (+7.3%) with byte-identical output. 950 MHz did not improve
@@ -53,8 +54,8 @@ The best safe single-stream runtime knob found so far is
 `GGML_VK_ALLOW_GRAPHICS_QUEUE=1`: on four cards it raises decode from **29.44 to 34.87 t/s**
 (+18%) with byte-identical greedy output and unchanged prefill. The gains do not add:
 combining it with `RADV_PERFTEST=nogttspill` gives 32.08 t/s, or 33.78 with the async
-transfer queue added. Pipeline parallelism was confirmed enabled at the default
-`-b 2048 -ub 512`; its diagnostic line is simply hidden without `--verbose`.
+transfer queue added. Pipeline parallelism was originally confirmed at `-b 2048 -ub 512`
+and remains enabled with the new ub640 profile; its diagnostic is hidden without `--verbose`.
 
 The tempting Q4_K prefill override
 `GGML_VK_TILE_M=256,128,64,64,32,64,2,4,4,1,64` is **invalid for this model**. Despite a

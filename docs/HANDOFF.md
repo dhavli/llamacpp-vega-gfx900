@@ -114,9 +114,10 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
 ## PP/TG improvement paths — tried, in-flight, and UNTRIED
 
 ### In-flight / next in queue
-- Production-shape A/B of graphics queue alone versus conservative nogttspill stacks; the
-  real 4×128k A/B is now complete: graphics changes total wall time only 53.29 → 52.60 s.
-  Next serving gate is the post-16GB two-pod run with one admitted request per pod.
+- The four-card shallow-context optimization list is exhausted through copy overlap, upstream and
+  Mesa compiler candidates, routed-MM geometry, discrete split neighbors, and ubatch refinement.
+  Ubatch 640 is the latest adopted win; see `docs/qwen4-optimization-roadmap.md`. The next serving
+  gate remains the post-16GB two-pod run with one admitted request per pod.
 
 ### Untried — ordered by expected value/effort (from the research pass + local analysis)
 1. **HBM2 memory clock: PROVEN DECODE LEVER.** The rig now boots with
@@ -128,8 +129,9 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    and re-pins core state 7 plus memory state 3 after every OD commit; without that re-pin,
    the driver silently resets core DPM and invalidates the A/B. It always restores 800 MHz.
    All seven cards report Samsung `61AB1A9C`; keep the different 945/1000 MHz Vega 64 BIOS
-   card 7 excluded. A guarded 950 MHz clock step is now justified before any Eliovp
-   `amdmemtweak` straps. **HBM2 has no ECC here: byte-verify output after every step.**
+   card 7 excluded. The guarded 950 MHz step was subsequently byte-correct but neutral/slower;
+   no HBM or strap experiment remains pending. **HBM2 has no ECC here: byte-verify output after
+   every step.**
 2. **GDN/SSM ops: PROFILED, LOW VALUE.** Direct GATED_DELTA_NET + SSM_CONV total 1.04 ms/token
    across all three devices (4.0% of GPU-op time, 2.9% wall). The profiler requires pipeline
    to be disabled via an unmatched tensor override; both normal and concurrent logger modes

@@ -1,0 +1,54 @@
+From 03c394659ab55af60c9ffebc5f3952bb61fa797d Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 3 Aug 2026 04:30:00 +0000
+Subject: [PATCH] perplexity: optionally process batch logits immediately
+
+Keep the standard behavior by default. LLAMA_PPL_STREAM_BATCHES=1 makes the
+single-sequence, non-logits-file path consume each batch's useful logits as
+soon as decode returns, avoiding the full-context logits accumulation buffer.
+---
+ tools/perplexity/perplexity.cpp | 34 ++++++++++++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index b03c9f27..16bbff8a 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -505,0 +506,2 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
++    const char * stream_batches_env = std::getenv("LLAMA_PPL_STREAM_BATCHES");
++    const bool stream_batches = stream_batches_env != nullptr && std::strcmp(stream_batches_env, "1") == 0;
+@@ -508,0 +511,5 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
++    if (stream_batches) {
++        GGML_ASSERT(n_seq == 1);
++        GGML_ASSERT(params.logits_file.empty());
++        LOG_INF("%s: streaming batch logits enabled\n", __func__);
++    }
+@@ -513 +520 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+-    if (num_batches > 1) {
++    if (num_batches > 1 && !stream_batches) {
+@@ -579 +586,2 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+-                    batch.logits  [idx]    = batch.pos[idx] >= first ? 1 : 0;
++                    batch.logits  [idx]    = batch.pos[idx] >= first &&
++                        (!stream_batches || batch.pos[idx] <= n_ctx - 2) ? 1 : 0;
+@@ -594 +602,16 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+-            if (num_batches > 1 && n_outputs > 0) {
++            if (stream_batches && n_outputs > 0) {
++                // A logit at position P predicts target token P+1. Only
++                // positions [first, n_ctx-2] contribute to perplexity.
++                const int output_first = std::max(first, j*n_batch);
++                const int output_count = std::min(n_ctx - 1, j*n_batch + batch_size) - output_first;
++                GGML_ASSERT(output_count == n_outputs);
++
++                const float * batch_logits = llama_get_logits(ctx);
++                llama_token * tokens_data = tokens.data() + start + output_first;
++                process_logits(n_vocab, batch_logits,
++                        tokens_data, output_count,
++                        workers, nll, nll2,
++                        logit_history.data() + start + output_first,
++                        prob_history.data()  + start + output_first);
++                count += output_count;
++            } else if (num_batches > 1 && n_outputs > 0) {
+@@ -614,0 +638 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
++            if (!stream_batches) {
+@@ -629,0 +654 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
++            }

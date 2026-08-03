@@ -531,3 +531,18 @@ was byte-identical and fell to 406.14 PP. A two-wave 128-thread/BM32 tile appear
 626.14 PP / 35.41 TG, but diverged immediately and measured PPL 248,320.0 versus the 131.0328
 control—the vocabulary-size ceiling. It was skipping/corrupting work. The isolated knob was removed;
 the stock medium MM-ID geometry remains the only correct performant choice among the bounded set.
+
+The final runtime bracket produced one genuine win. Ubatch 384 was byte-identical but regressed to
+525.96 PP. Ubatch 576 reached 569.07 PP but lowered TG to 33.90. Ubatch 640 initially measured
+576.55 PP / 35.51 TG, with a coherent but different deterministic continuation. A new default-off
+streaming perplexity mode was added because the old verifier accumulates a half-context of logits
+and OOMs at large batches on this host. Streaming `-b128` exactly reproduced the historical
+131.0328 control; true `-b640 -ub640` measured 130.9594 +/- 5.17693, quality-equivalent.
+
+The repeat same-runtime pair measured 571.09/33.53 at ub640 versus 558.67/32.43 at ub512:
++2.22% PP, +3.39% TG, and 2.35% lower total request time. A third fail-closed run under
+`RADV_PERFTEST=nogttspill` reached 575.50 PP, reproduced the ub640 output hash, offloaded 42/42
+layers, and showed zero evicted/invalidated BOs or GPU faults. Per-process DRM accounting showed
+4.5–5.7 GiB of model VRAM per active card, the expected ~535 MiB host/staging allocation only on
+the main client, and tiny ~2.4 MiB GTT allocations on downstream clients. Adopt `-ub 640` for this
+four-card shallow-context profile; keep `-b 2048`.
