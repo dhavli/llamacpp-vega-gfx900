@@ -34,10 +34,14 @@ On the 5,511-token prompt plus 128 generated tokens, two repeats reached
 This is +21.5% PP with flat decode versus the initial b512/ub256 server control at
 593.55/24.69. Ubatch 448 is pathological (105.44/2.32), while b1536/ub384 is a
 prefill-only 732.47/19.75 tradeoff. q4 KV makes b2048 fit but is slower at 600.76/24.39.
+At real depth, a 121,243-token fill plus 128-token generation completes at
+**284.89 PP / 17.74 TG**, with the same deterministic completion and no GPU faults.
+Thus 128K is operational, but shallow decode must not be extrapolated to a full context.
 
-The shipped 252 MB MTP drafter does not fit this two-card 128K profile. A diagnostic
+The shipped 252 MB MTP drafter is host-RAM-blocked on this two-card 128K profile. A diagnostic
 three-card run reaches 85.96% acceptance but collapses to **378.01 PP / 5.19 TG** because
-draft calls cross the Gen2 x1 links. Do not enable MTP on this rig.
+draft calls cross the Gen2 x1 links. Keep MTP off now; after the RAM upgrade, retest the exact
+two-card profile before making a permanent model-level rejection.
 
 **Qwen3.6-35B-A3B at UD-Q4_K_XL** (21.27 GiB, 256 experts / top-8, 3B active,
 30 gated-delta-net + 10 full-attention layers), split across multiple cards:

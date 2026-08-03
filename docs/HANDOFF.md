@@ -11,11 +11,14 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 - One text-only 2-GPU pod allocates 128K context with q8 K/V under `nogttspill`. The frozen
   balanced launch is b1408/ub384, output reserve 128, graphics queue, global lock, no mmap,
   cache RAM 0, and context checkpoints 0. Repeats: 721.01/24.24 and 720.76/25.35 PP/TG.
+  A real 121,243-token fill reaches 284.89 PP and then 17.74 TG for 128 tokens, proving the
+  allocation is usable near full depth while bounding the long-context slowdown.
 - Cache/checkpoint disablement is the largest measured server lever: b1024/ub384 moves from
   626.04/25.24 to 670.81/25.28. The b1408 refinement raises average PP to 720.88.
 - Boundaries: ub448 collapses to 105.44/2.32; b1536/ub384 trades to 732.47/19.75;
   b2048/ub512 q8 is host-OOM-killed; q4 KV permits it but is slower at 600.76/24.39.
-- MTP is rejected. It cannot initialize at 2 GPUs/128K. On three GPUs it fits and accepts
+- Two-card MTP is blocked by the current 3.7 GiB host RAM: the OOM killer terminates slot
+  initialization. Retest after the RAM upgrade. Three-GPU MTP is rejected: it fits and accepts
   85.96% of draft tokens, yet reaches only 378.01/5.19 due to x1-riser draft overhead.
 - Per the operator, do not continue multi-pod testing until host RAM is upgraded. Focus any
   follow-up on one two-card pod. Reproduction harness:
