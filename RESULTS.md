@@ -480,3 +480,10 @@ cleanly as a separate Mesa 26.1.5 runtime and retained byte-identical output. It
 regressed the production workload from 559.23 PP / 35.46 TG to 511.27 / 31.31: -8.6% PP and
 -11.7% TG. The isolated Mesa target and patch were removed. On this shader mix, demoting/removing
 those barriers is actively harmful rather than a small scheduling win.
+
+The broader gfx9 RADV thread-ID/shuffle series (MR43022 plus MR43240 through `f44a6b57`, excluding
+the gfx10-only tail) was then adapted to Mesa 26.1.5. Its bounded compatibility additions were the
+MR-owned `BITSET_EXTRACT64` helper and the older NIR API's explicit component-count argument. The
+full Mesa build and runtime completed, output remained byte-identical, but throughput dropped to
+507.49 PP / 31.89 TG versus 559.23 / 35.46 control (-9.3%/-10.1%). The entire isolated override
+was removed. Both credible post-26.1.5 gfx900 compiler candidates therefore regress this workload.

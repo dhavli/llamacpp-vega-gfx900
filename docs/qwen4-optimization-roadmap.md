@@ -67,9 +67,10 @@ Hard configuration findings:
    its required correctness fix was built as an isolated Mesa 26.1.5 runtime. Output remained
    byte-identical, but performance collapsed from 559.23/35.46 to 511.27/31.31 PP/TG. The Mesa
    override was removed.
-6. **Next:** test the gfx9-applicable RADV thread-ID/shuffle optimization series through
-   `f44a6b57`; exclude its later gfx10-only permutation tail. Require ISA evidence or a real
-   throughput signal before retaining the broad compiler backport.
+6. **Completed / rejected:** the complete gfx9-applicable RADV thread-ID/shuffle series through
+   `f44a6b57` was adapted to Mesa 26.1.5 and built separately. Output was byte-identical, but
+   performance fell to 507.49/31.89 PP/TG (-9.3%/-10.1%). The override was removed. The remaining
+   UUB pass affects under 1% of general shaders and is not credible without matching active IR.
 7. After the 16 GB host-RAM upgrade, revisit the already-pinned tensor-parallel path and
    experimental Vulkan AllReduce. Do not attempt it on the current 3.8 GB host.
 
