@@ -48,7 +48,10 @@ Hard configuration findings:
    copies; the three staged-copy legs consumed about 0.8 seconds of a 10.1-second prefill. A
    direct coherent mapped-memory copy was tested and rejected: uncached/BAR reads inflated copy
    time to roughly 11.7 seconds and collapsed PP to 269.31. Dedicated transfer queues were
-   neutral. Keep staged copies until a genuinely asynchronous/double-buffered design is ready.
+   neutral. A blocking two-slot, 1 MiB double-buffered pipeline was then implemented and traced.
+   It overlapped 333 ms while moving 138 MB, but same-binary ON/OFF was 568.59/34.40 versus
+   560.11/35.57 PP/TG, with only a 0.16% total-request improvement. It was removed because the
+   +1.5% PP signal misses the 2% gate and TG regresses 3.3%. Keep the stock staged-copy path.
 2. **Completed:** synchronization-free fixed-counter histograms show that real prefill Q4_K
    dispatches are exclusively in the 257–512-token MM bucket (198–242 calls per card). The
    only vec calls are the 2–8-token final/decode tail. This removes a vec/MM cutoff sweep from
@@ -82,8 +85,9 @@ Hard configuration findings:
   `TOPK_MOE_EARLY_SOFTMAX_NORM`; expected benefit is zero.
 - Eye-catching Qwen prefill patches #25483 and #22970 require cooperative matrices, which
   gfx900 does not expose. NonTemporal streamed-weight work targets GFX10+, not Vega10.
-- A small post-Mesa-26.1.5 RADV thread-ID/subgroup series is a low-priority <=1% candidate;
-  isolate it from other Mesa changes if tested.
+- The post-Mesa-26.1.5 RADV thread-ID/subgroup series was isolated and tested; it regressed
+  PP/TG by 9.3%/10.1% and was removed. The remaining UUB pass has no matching active-shader IR
+  evidence and an estimated sub-1% general-shader reach, so it is excluded from implementation.
 
 Every implementation candidate must pass deterministic output, RAM-safe perplexity when
 math/order changes, no CPU placement/spill/faults, and repeated PP/TG gates before adoption.

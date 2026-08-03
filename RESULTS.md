@@ -487,3 +487,13 @@ MR-owned `BITSET_EXTRACT64` helper and the older NIR API's explicit component-co
 full Mesa build and runtime completed, output remained byte-identical, but throughput dropped to
 507.49 PP / 31.89 TG versus 559.23 / 35.46 control (-9.3%/-10.1%). The entire isolated override
 was removed. Both credible post-26.1.5 gfx900 compiler candidates therefore regress this workload.
+
+The remaining copy-overlap candidate was implemented as a default-off, blocking two-slot pipeline.
+For cross-device transfers above 1 MiB, 1 MiB source reads alternated with destination uploads on a
+worker, preserving the generic synchronous copy contract. It moved 138,338,304 bytes in 33 copies
+and 132 chunks; diagnostic timings recorded 457 ms of reads, 516 ms of writes, 639 ms wall, and
+333 ms of overlap. The real serving A/B did not convert that overlap into an acceptable win. The
+same binary measured 560.11 PP / 35.57 TG with the pipeline off and 568.59 / 34.40 with it on:
++1.5% PP, -3.3% TG, and only 0.16% lower total request time (13.850 versus 13.828 seconds). Output
+was byte-identical. Because it misses the 2% adoption gate and harms decode, the prototype was
+removed; per-chunk thread launch and an extra host copy consume most of the theoretical benefit.
