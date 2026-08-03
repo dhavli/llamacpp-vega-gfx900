@@ -16,6 +16,7 @@ n_ubatch=${UBATCH:-512}
 tensor_split=${TENSOR_SPLIT-}
 use_mmap=${USE_MMAP:-0}
 expert_count=${EXPERT_COUNT:-8}
+output_reserve=${OUTPUT_RESERVE:-full}
 
 while pgrep -f '[c]oldcard-finder' >/dev/null; do
     echo 'coldcard-finder owns the GPUs; waiting'
@@ -28,6 +29,11 @@ if [[ ${graphics_queue} == 1 ]]; then
 fi
 if [[ ${per_queue_mutex} == 1 ]]; then
     server_env+=(GGML_VK_PER_QUEUE_MUTEX=1)
+fi
+if [[ ${output_reserve} == full ]]; then
+    server_env+=(LLAMA_SERVER_FULL_OUTPUT_RESERVE=1)
+else
+    server_env+=(LLAMA_SERVER_OUTPUT_RESERVE="${output_reserve}")
 fi
 
 mmap_args=()
@@ -46,7 +52,7 @@ if [[ ${expert_count} != 8 ]]; then
 fi
 
 env "${server_env[@]}" \
-GGML_VK_VISIBLE_DEVICES=0,1,2,3 LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
+GGML_VK_VISIBLE_DEVICES=0,1,2,3 \
     "${runtime}/bin/llama-server" -m "${model}" -ngl 99 -fa on "${mmap_args[@]}" \
     -ctk q8_0 -ctv q8_0 -c $((4 * 131072)) -np 4 \
     -b "${n_batch}" -ub "${n_ubatch}" "${split_args[@]}" \

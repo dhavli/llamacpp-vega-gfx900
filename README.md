@@ -108,6 +108,10 @@ At four-slot 128k server shape the ranking changes: top-6 dominates both axes, w
 Top-5 instead favors prefill: two exact-shape runs reached 606.38/28.40 and 606.76/27.57,
 with identical output. Expose it only when prompt throughput outweighs its repeatable bounded-task
 regression; top-6 remains the lowest general-purpose quality-gated tier.
+The final frozen Qwen server profile replaces the boolean full-output graph reservation with
+`LLAMA_SERVER_OUTPUT_RESERVE=128`. That keeps top-6 at 572.17/29.54 and recovers enough VRAM for
+automatic-placement ub640, which reaches **579.31 PP / 29.65 TG** with identical output. Reserve
+64 regresses decode to 26.68 and ub768 still fails the fit gate.
 
 Per-op Vulkan profiling also rules out the fused GDN kernels as a large decode lever. Across
 three devices, `GATED_DELTA_NET` + `SSM_CONV_SILU` total only **1.04 ms/token**—4.0% of

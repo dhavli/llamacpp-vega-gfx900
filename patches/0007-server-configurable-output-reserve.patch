@@ -1,0 +1,37 @@
+From 7e1b30431dcb7b2e411db2526a1b99c8305f93fc Mon Sep 17 00:00:00 2001
+From: Vega benchmark harness <vega@example.invalid>
+Date: Mon, 3 Aug 2026 09:00:00 +0000
+Subject: [PATCH] server: make output graph reservation configurable
+
+Keep the existing full-reservation compatibility switch, but allow a bounded
+numeric reservation so hybrid models can find the smallest graph shape that
+preserves decode performance. This is an opt-in benchmark hook; default server
+behavior is unchanged.
+---
+ tools/server/server-context.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 23d0e21..82764fa 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -55,6 +55,17 @@ static uint32_t server_n_outputs_max(const common_params & params) {
+     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+     // A/B hook for hybrid/recurrent models whose decode graph behaves very
+     // differently from llama-completion when server reserves only one output.
++    if (const char * value = getenv("LLAMA_SERVER_OUTPUT_RESERVE")) {
++        char * end = nullptr;
++        const unsigned long parsed = strtoul(value, &end, 10);
++        if (end != value && *end == '\0') {
++            return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, parsed));
++        }
++
++        SRV_WRN("invalid LLAMA_SERVER_OUTPUT_RESERVE='%s'; using default reservation\n", value);
++    }
++
++    // Compatibility with the original boolean experiment hook.
+     if (getenv("LLAMA_SERVER_FULL_OUTPUT_RESERVE") != nullptr) {
+         return n_batch;
+     }
+-- 
+2.51.2

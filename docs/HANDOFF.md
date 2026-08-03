@@ -78,6 +78,11 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   Top-4 is the stopping boundary. Although shallow speed reached 706.43/36.52, PPL rose to
   136.6585 +/- 5.5829 and the first task run added semantic failures (110 classified as prime,
   wrong prime sum) plus an array-only schema violation. Do not test or deploy lower counts.
+  Final frozen Qwen server result: patch 0007 adds numeric `LLAMA_SERVER_OUTPUT_RESERVE=N`.
+  Reserve 128 preserved top-6 at 572.17/29.54; reserve 64 kept PP flat but reduced TG to 26.68.
+  With reserve 128, automatic-placement ub640 now fits and reaches 579.31/29.65 with the
+  established deterministic output hash. Ub768 still fails the `nogttspill` fit gate. Use
+  output reserve 128 + ub640 as the frozen prompt/decode-balanced top-6 server profile.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
