@@ -51,7 +51,8 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 - Pipeline parallelism is enabled. The env stacks are non-additive. The Qwen TILE_M candidate
   is falsified by perplexity. These results are recorded in `benchmarks/llm/index.jsonl`.
 - Best four-card top-8 shallow profile: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` plus
-  `-ts 0.85,1.05,1.05,1.05 -b 2048 -ub 768` reaches **583.34–584.80 PP / 34.93–35.64 TG**
+  `GGML_VK_PER_QUEUE_MUTEX=1 -ts 0.85,1.05,1.05,1.05 -b 2048 -ub 768` reaches
+  **583–585 PP / 34–36 TG**
   on the real 5,629-token prompt. Streaming PPL is 131.2037 versus 131.0328 control, and the
   fail-closed residency gate passed. Preserve device order `0,1,2,3`; reversing it collapses
   to 88.55 / 2.81. See `docs/qwen4-optimization-roadmap.md`.
@@ -60,6 +61,10 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   529.63/26.95 with identical output and passes the 500/25 SLA. The shallow custom split with
   ub640 or ub768 is OOM-killed under `nogttspill` at this slot allocation. Do not copy the
   shallow profile into the long-context server launch.
+- Per-device Vulkan submission locking is adopted. It removes cross-GPU convoying from the
+  process-global mutex while preserving one shared mutex for wrappers of the same queue. Repeated
+  averages improved TG 32.77 -> 34.64 with flat PP, and the fail-closed result was 583.74/35.56.
+  Export `GGML_VK_PER_QUEUE_MUTEX=1` for the shallow profile.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow

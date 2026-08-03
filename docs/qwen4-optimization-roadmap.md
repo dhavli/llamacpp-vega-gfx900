@@ -8,6 +8,7 @@ Target: Qwen3.6-35B-A3B UD-Q4_K_XL, top-8, four forward-ordered Vega devices
 ```bash
 GGML_VK_VISIBLE_DEVICES=0,1,2,3 \
 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+GGML_VK_PER_QUEUE_MUTEX=1 \
 LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
   vega-runtime/bin/llama-server \
   -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
@@ -99,6 +100,17 @@ Hard configuration findings:
     cliff. Batch sweeps at 2560 and 3200 were mixed or worse, and aligned b2304/ub768 regressed
     decode and total time. The final `nogttspill` run offloaded 42/42 layers with no eviction or
     faults. Ubatch 768 with batch 2048 is the closed-matrix shallow-context winner.
+11. **Completed / rejected:** upstream PR #25005's FLOP-based graph-submission heuristic was
+    backported behind an opt-in A/B. It preserved output but changed 583.75/32.00 PP/TG and
+    13.855 seconds to 574.56/35.28 and 13.639 seconds. The 1.57% PP regression and only 1.56%
+    total improvement miss the gate and agree with the later upstream MoE regression report.
+    The patch was removed.
+12. **Completed / adopted:** the process-global Vulkan submission mutex was narrowed to one
+    mutex per underlying device queue, while aliased compute/transfer wrappers still share a
+    lock. Two-run global-lock averages were 583.95/32.77 PP/TG and 13.761 seconds; per-device
+    locks averaged 584.71/34.64 and 13.531 seconds (+0.13% PP, +5.7% TG). The fail-closed run
+    reached 583.74/35.56 with identical output and no faults. Export
+    `GGML_VK_PER_QUEUE_MUTEX=1`.
 
 ## Upstream audit conclusions
 

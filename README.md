@@ -31,11 +31,18 @@ doesn't ask for the FLOPs these cards can't deliver. On 3 cards a real 5629-toke
 prefills at **624 t/s** and then generates at **30.8 t/s**.
 
 The best validated four-card top-8 profile combines the graphics queue with an explicit
-layer split and ubatch 768: `GGML_VK_ALLOW_GRAPHICS_QUEUE=1 -ts 0.85,1.05,1.05,1.05 -ub 768`.
+layer split, ubatch 768, and per-device queue locking:
+`GGML_VK_ALLOW_GRAPHICS_QUEUE=1 GGML_VK_PER_QUEUE_MUTEX=1 -ts 0.85,1.05,1.05,1.05 -ub 768`.
 On the real 5,629-token prompt, repeated ub768 runs reached **583.34–584.80 PP** and
 34.93–35.64 TG. Streaming PPL is 131.2037 versus 131.0328 control, and the fail-closed
 `nogttspill` gate reached 585.54/34.69 with no eviction or faults. See
 `docs/qwen4-optimization-roadmap.md`.
+
+The queue-lock change removes an unnecessary process-global `vkQueueSubmit` mutex while retaining
+a shared lock for wrappers that alias the same Vulkan queue. Repeated same-binary averages were
+583.95 PP / 32.77 TG with the global lock and 584.71 / 34.64 with per-device locks; the final
+`nogttspill` gate reached 583.74 / 35.56 with identical output. The upstream FLOP-based submission
+heuristic was also tested but rejected: PP regressed 1.57% and total time improved only 1.56%.
 
 For the production-shaped server with four resident 128k slots, keep automatic layer placement
 and `-ub 512`: the shallow custom split with ub640/768 fails the no-spill fit gate. With exactly
