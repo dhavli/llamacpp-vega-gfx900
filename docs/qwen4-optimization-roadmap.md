@@ -88,6 +88,9 @@ Hard configuration findings:
 - The post-Mesa-26.1.5 RADV thread-ID/subgroup series was isolated and tested; it regressed
   PP/TG by 9.3%/10.1% and was removed. The remaining UUB pass has no matching active-shader IR
   evidence and an estimated sub-1% general-shader reach, so it is excluded from implementation.
+- Upstream PR #22933's GCN subgroup reduction was tested through the existing
+  `GGML_VK_GCN_SUBGROUP_REDUCE=1` gate. Same-binary OFF/ON was 561.10/35.48 versus
+  561.02/35.23 PP/TG, byte-identical. The gfx900-inapplicable integer-dot vecq half was not ported.
 
 Every implementation candidate must pass deterministic output, RAM-safe perplexity when
 math/order changes, no CPU placement/spill/faults, and repeated PP/TG gates before adoption.

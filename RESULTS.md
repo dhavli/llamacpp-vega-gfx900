@@ -497,3 +497,10 @@ same binary measured 560.11 PP / 35.57 TG with the pipeline off and 568.59 / 34.
 +1.5% PP, -3.3% TG, and only 0.16% lower total request time (13.850 versus 13.828 seconds). Output
 was byte-identical. Because it misses the 2% adoption gate and harms decode, the prototype was
 removed; per-chunk thread launch and an extra host copy consume most of the theoretical benefit.
+
+The final post-pin upstream Vulkan audit identified PR #22933's GCN subgroup reduction as the
+only previously undocumented candidate with even marginal evidence. Its applicable host gate was
+already exposed by `GGML_VK_GCN_SUBGROUP_REDUCE=1`; gfx900 cannot use the PR's separate vecq
+shader work because integer dot product is absent. A same-binary production A/B measured
+561.10 PP / 35.48 TG with the knob off and 561.02 / 35.23 with it on. Total request time worsened
+0.20%, and output was byte-identical. The knob remains default-off and the candidate is exhausted.
