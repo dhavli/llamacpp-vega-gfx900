@@ -117,6 +117,10 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    control (+7.6% / +5.7%). PPL is 131.422 vs 131.033 (+0.30%, inside error); both configs
    correctly answered the rate, Python mutable-default, and HTTP PUT tasks. The prime task
    truncated in both and was excluded. Expose top-6 as optional, keep top-8 as default.
+   A new top-7 probe on the final ub768 profile reached 609.39 PP / 36.04 TG and PPL
+   132.3556 +/- 5.27668 versus the top-8 ub768 control 131.2037 +/- 5.18752 (+0.88%). It
+   passes the synthetic screen but still requires a broader deterministic task suite before
+   promotion; top-8 remains the production default.
 5. **llama-server graph reservation: FIXED.** Server forces `n_outputs_max=n_parallel`, which
    made one-slot Qwen decode 3.77 TG while identical `llama-completion` reached 32.47.
    `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` restores 29.70 TG and identical text. Disabling
