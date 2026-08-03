@@ -99,7 +99,7 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 | `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` | TG **29.44 → 34.87 (+18%)**, PP unchanged. Biggest single knob found |
 | `RADV_PERFTEST=nogttspill` | TG 29.44 → 31.72 (+8%), PP unchanged |
 | `GGML_VK_ASYNC_USE_TRANSFER_QUEUE=1` | +2% alone; combo gtt+tq (30.3) < gtt alone (31.7) — tq slightly hurts when stacked |
-| `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` | +4% TG alone |
+| `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1` | +4% TG alone; rejected in final stack: -0.9% PP / -4.0% TG |
 | `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` | server 3.77 → 29.70 TG (7.9×), short PP 22.8 → 134.2; restores parity with completion (32.47 TG) |
 | Real server 4×128k concurrency | all four requests complete, but streams get only 130-492 PP / 3.4-13.0 TG; serialize to one active request/pod for the ≥500/25 SLA |
 | GDN/SSM per-op profile | direct GATED_DELTA_NET + SSM_CONV = 1.04 ms/token, only 2.9% of wall; kernel work here is low value |
@@ -150,6 +150,10 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
 ## PP/TG improvement paths — resolved or hardware-blocked
 
 ### Current-hardware closure / next hardware gate
+- The production probe defaults now match the validated current-host launch: final `hycp2s`
+  runtime, one admitted request, graphics queue, global lock, automatic split, `--no-mmap`,
+  and ub512. Override these explicitly only for an A/B; the former defaults recreated the
+  known-bad concurrent/shallow profile.
 - The four-card shallow-context optimization list is exhausted through copy overlap, upstream and
   Mesa compiler candidates, routed-MM geometry, discrete split neighbors, and ubatch refinement.
   Batch 2048 / ubatch 768 is the latest adopted win; see `docs/qwen4-optimization-roadmap.md`. The next serving

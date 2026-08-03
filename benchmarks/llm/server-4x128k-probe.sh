@@ -3,18 +3,18 @@
 # a configurable number of simultaneous 5.6k-token prompts and deterministic generations.
 set -euo pipefail
 
-runtime=${RUNTIME:-/nix/store/scb4cmx0h15sfbrapkjyx0r5jrzv8gpi-vega-runtime}
+runtime=${RUNTIME:-/nix/store/hycp2s33y3mpv5cslr6ghly05rmm8kqy-vega-runtime}
 model=${MODEL:-/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}
 prompt_file=${PROMPT:-/root/bonsai/prompt8k.txt}
 port=${PORT:-8089}
 label=${LABEL:-server-4x128k}
-graphics_queue=${GRAPHICS_QUEUE:-0}
+graphics_queue=${GRAPHICS_QUEUE:-1}
 per_queue_mutex=${PER_QUEUE_MUTEX:-0}
-requests=${REQUESTS:-4}
+requests=${REQUESTS:-1}
 n_batch=${BATCH:-2048}
-n_ubatch=${UBATCH:-768}
-tensor_split=${TENSOR_SPLIT-0.85,1.05,1.05,1.05}
-use_mmap=${USE_MMAP:-1}
+n_ubatch=${UBATCH:-512}
+tensor_split=${TENSOR_SPLIT-}
+use_mmap=${USE_MMAP:-0}
 expert_count=${EXPERT_COUNT:-8}
 
 while pgrep -f '[c]oldcard-finder' >/dev/null; do
