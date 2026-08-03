@@ -119,8 +119,12 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    truncated in both and was excluded. Expose top-6 as optional, keep top-8 as default.
    A new top-7 probe on the final ub768 profile reached 609.39 PP / 36.04 TG and PPL
    132.3556 +/- 5.27668 versus the top-8 ub768 control 131.2037 +/- 5.18752 (+0.88%). It
-   passes the synthetic screen but still requires a broader deterministic task suite before
-   promotion; top-8 remains the production default.
+   passes the synthetic screen. The subsequent exact-answer matrix ran top-8/top-7/top-6 twice
+   in fresh processes. Strict pass counts were 5/8, 6/8, and 6/8; top-7 and top-6 both reached
+   7/8 when a fenced but structurally correct JSON array counts semantically. All three missed
+   the same bolts remainder task; top-7/top-6 fixed top-8's Python alias/copy error and introduced
+   no new failure. Top-7 is the decode-biased speed tier; top-6 is prefill-biased. Top-8 remains
+   the conservative trained-routing default because this suite is still bounded.
 5. **llama-server graph reservation: FIXED.** Server forces `n_outputs_max=n_parallel`, which
    made one-slot Qwen decode 3.77 TG while identical `llama-completion` reached 32.47.
    `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` restores 29.70 TG and identical text. Disabling

@@ -92,6 +92,10 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
   improves the 5.6k-prompt probe to 559 PP / 31.1 TG. PPL changed only 131.03 → 131.42 and
   three deterministic tasks remained correct, but this is still a narrow evaluation;
   top-8 remains the production default.
+- A final-runtime top-7 tier (`expert_used_count=int:7`) is the better latency/decode tradeoff:
+  609.39 PP / 36.04 TG and PPL 132.3556 +/- 5.2767. Top-6 is prefill-biased at
+  629.80 / 33.94. Both matched or exceeded top-8 on the bounded repeated eight-task suite,
+  but both change trained routing semantics; expose them as explicit opt-in service tiers.
 - At the exact 4×128k allocation, graphics queue changed four-request wall time only
   53.29 → 52.60 seconds (~1%). Keep the conservative `nogttspill` launch default; the
   graphics-queue solo win is not a meaningful mixed-concurrency win.

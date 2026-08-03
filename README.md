@@ -88,6 +88,13 @@ PPL is 131.42 vs 131.03 (a 0.30% delta, inside error), three deterministic tasks
 quality-equivalent, and the long-prompt probe improves from 519.7/29.4 to 559.1/31.1 PP/TG.
 This narrow evaluation does not establish broad no-loss quality, so top-8 remains the default.
 
+The final-runtime expert frontier adds a better-balanced top-7 tier. Top-7 reaches
+**609.39 PP / 36.04 TG** with PPL 132.3556 +/- 5.2767 versus top-8's 131.2037 +/- 5.1875.
+Across two fresh-process runs of eight exact/structural tasks, top-7 introduced no failure absent
+in top-8 and fixed top-8's Python alias/copy error. Top-6 reaches **629.80 PP / 33.94 TG** and
+matches top-7's task pass vector. Use top-7 for decode/latency, top-6 for prefill-heavy traffic,
+and retain top-8 when preserving the model's trained routing semantics is more important than speed.
+
 Per-op Vulkan profiling also rules out the fused GDN kernels as a large decode lever. Across
 three devices, `GATED_DELTA_NET` + `SSM_CONV_SILU` total only **1.04 ms/token**—4.0% of
 instrumented GPU-op time and 2.9% of wall time. The logger requires pipeline parallelism to
