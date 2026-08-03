@@ -52,6 +52,9 @@ Hard configuration findings:
    It overlapped 333 ms while moving 138 MB, but same-binary ON/OFF was 568.59/34.40 versus
    560.11/35.57 PP/TG, with only a 0.16% total-request improvement. It was removed because the
    +1.5% PP signal misses the 2% gate and TG regresses 3.3%. Keep the stock staged-copy path.
+   A v2 with one persistent writer per tensor (rather than per chunk) also failed: 1 MiB measured
+   569.59/32.11 with 645 ms copy wall, while 512 KiB measured 568.53 PP and 660 ms wall. Both are
+   no better than v1's 639 ms wall; larger chunks reduce overlap, so the bounded sweep was closed.
 2. **Completed:** synchronization-free fixed-counter histograms show that real prefill Q4_K
    dispatches are exclusively in the 257–512-token MM bucket (198–242 calls per card). The
    only vec calls are the 2–8-token final/decode tail. This removes a vec/MM cutoff sweep from

@@ -504,3 +504,12 @@ already exposed by `GGML_VK_GCN_SUBGROUP_REDUCE=1`; gfx900 cannot use the PR's s
 shader work because integer dot product is absent. A same-binary production A/B measured
 561.10 PP / 35.48 TG with the knob off and 561.02 / 35.23 with it on. Total request time worsened
 0.20%, and output was byte-identical. The knob remains default-off and the candidate is exhausted.
+
+A lower-overhead copy-pipeline v2 then replaced per-chunk `std::async` launches with one ordered
+writer thread per complete tensor copy and exposed a bounded chunk-size control. At the comparable
+1 MiB size, it was byte-identical and reached 569.59 PP / 32.11 TG, but copy wall time was 645 ms
+versus v1's 639 ms; total request time regressed to 14.090 seconds. A prefill-only 512 KiB run
+doubled the chunks to 264, reached 568.53 PP, and worsened copy wall time again to 660 ms. The
+nominal overlap counter rose, proving that it is not the limiting metric: additional CPU staging
+copies and fence/submission costs consume the gain. Larger chunks necessarily reduce overlap, so
+the sweep was pruned and v2 removed. A blocking per-tensor pipeline cannot clear the 2% gate.
