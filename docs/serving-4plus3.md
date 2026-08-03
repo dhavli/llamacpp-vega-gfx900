@@ -27,9 +27,10 @@ Total: 5-6 streams at 128k-class context ≥ the 4×128k / 512k goal.
 ```bash
 # Pod A - 4 cards
 GGML_VK_VISIBLE_DEVICES=0,1,2,3 RADV_PERFTEST=nogttspill \
+GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
 LLAMA_SERVER_FULL_OUTPUT_RESERVE=1 \
   vega-runtime/bin/llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-  -ngl 99 -fa on -ctk q8_0 -ctv q8_0 \
+  -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 \
   -c $((4*131072)) -np 4 --cache-ram 0 --ctx-checkpoints 0 \
   --host 0.0.0.0 --port 8080
 
@@ -54,8 +55,9 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
 
 ## RAM-minimal rules
 
-- Keep default mmap (do NOT use `--no-mmap` in serving): weight pages are read-only,
-  shared between both pods, and evictable after VRAM upload. No `--mlock`.
+- On the current 3.8 GiB host, use `--no-mmap` for a single four-card pod: the exact 4x128k
+  allocation was OOM-killed during upload with mmap. Re-evaluate default mmap after the 16 GiB
+  upgrade, where its read-only pages can be shared between both pods. Never use `--mlock`.
 - q8_0 KV is mandatory at 128k (21.0 vs 9.0 t/s at f16 — spill cliff), and KV lives in VRAM.
 - Steady-state host footprint ≈ 1-1.5 GiB pinned GTT staging per pod + ~1 GiB anon per
   pod: ~5 GiB total on a 16 GB box, rest = page cache (makes restarts ~4× faster).
@@ -71,7 +73,8 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
 - Aggregate prefill both pods busy: ~1000-1150 t/s. Do **not** set the Bonsai production
   `GGML_VK_TILE_M` value for this Qwen Q4_K model: although it appeared 19% faster and kept
   a long greedy prefix, perplexity exploded from 131.03 to 3.58 million.
-- Decode: pod A 52 t/s aggregate at 4 active streams (32 solo); pod B 31 solo.
+- Decode: pod A 52 t/s aggregate at 4 active streams; the exact four-slot/single-admission server
+  reaches 26.95 TG with the graphics queue. Pod B historically reached about 31 solo.
 - The 52 t/s batched-bench figure is aggregate, not per-stream. A real four-request server
   run produced 3.4-13.0 TG per stream depending on scheduler interleaving. Solo mode is the
   only measured configuration that meets ≥25 TG per active stream.
@@ -82,8 +85,9 @@ work or run it in best-effort capacity mode; two pods provide two concurrent SLA
   conservative `RADV_PERFTEST=nogttspill` policy: graphics + nogttspill gives 32.08 t/s,
   and adding the async transfer queue gives 33.78 t/s. Keep `nogttspill` in the launch
   commands so an over-capacity configuration fails instead of silently paging weights over
-  Gen2 x1; use graphics-queue alone only after the exact production slot/context allocation
-  is proven to fit.
+  Gen2 x1. The exact 4x128k allocation now passes with both `nogttspill` and graphics queue,
+  automatic placement, and ub512: 529.63 PP / 26.95 TG versus 529.45 / 23.41 without graphics,
+  with byte-identical output. This meets the 500/25 single-admission SLA.
 - Optional quality/speed tradeoff: `--override-kv qwen35moe.expert_used_count=int:6`
   improves the 5.6k-prompt probe to 559 PP / 31.1 TG. PPL changed only 131.03 → 131.42 and
   three deterministic tasks remained correct, but this is still a narrow evaluation;

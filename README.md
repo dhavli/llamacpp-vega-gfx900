@@ -37,6 +37,11 @@ On the real 5,629-token prompt, repeated ub768 runs reached **583.34–584.80 PP
 `nogttspill` gate reached 585.54/34.69 with no eviction or faults. See
 `docs/qwen4-optimization-roadmap.md`.
 
+For the production-shaped server with four resident 128k slots, keep automatic layer placement
+and `-ub 512`: the shallow custom split with ub640/768 fails the no-spill fit gate. With exactly
+one admitted request, adding the graphics queue raises **529.45 PP / 23.41 TG** to
+**529.63 PP / 26.95 TG**, byte-identically, restoring the 500/25 per-stream SLA.
+
 Controlled clock experiments on cards 1–3 found that 900 MHz HBM raises deterministic
 decode from 30.93 to **33.18 t/s** (+7.3%) with byte-identical output. 950 MHz did not improve
 on that result. A 1700 MHz / 1200 mV core clock is stable and byte-identical but not useful:

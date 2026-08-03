@@ -55,6 +55,11 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   on the real 5,629-token prompt. Streaming PPL is 131.2037 versus 131.0328 control, and the
   fail-closed residency gate passed. Preserve device order `0,1,2,3`; reversing it collapses
   to 88.55 / 2.81. See `docs/qwen4-optimization-roadmap.md`.
+- The four-slot 128k server has a distinct fit optimum. Automatic placement with ub512 and
+  one admitted request measures 529.45/23.41 PP/TG; adding the graphics queue reaches
+  529.63/26.95 with identical output and passes the 500/25 SLA. The shallow custom split with
+  ub640 or ub768 is OOM-killed under `nogttspill` at this slot allocation. Do not copy the
+  shallow profile into the long-context server launch.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
@@ -221,7 +226,8 @@ forbids; also 2-core Celeron).
   local timeouts get backgrounded by the harness; just re-probe.
 - **GTT spill is invisible in VRAM readings** (evicted buffers stop counting). Judge fit by
   throughput vs llama-bench, never by "free VRAM". `RADV_PERFTEST=nogttspill` is now default.
-- **Disk is at 97%** — 2.2 GB free. Don't create big files; /tmp is on the root disk.
+- **Disk is nearly full** (99%, about 1.1 GB free on 2026-08-03). Don't create big files;
+  `/tmp` is on the root disk.
 - The 5629-token benchmark prompt is `/root/bonsai/prompt8k.txt` (synthetic keyword soup —
   fine for A/B, absolute ppl numbers are meaningless).
 - Locale warnings (`LC_ALL: cannot change locale`) are noise; `LC_ALL=C` placates.
