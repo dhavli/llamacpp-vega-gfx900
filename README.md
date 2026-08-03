@@ -51,6 +51,13 @@ one admitted request, adding the graphics queue raises **529.45 PP / 23.41 TG** 
 The quality-gated top-6 opt-in tier is faster still: two exact-shape runs averaged
 **572.26 PP / 28.31 TG**, with identical same-tier output. Top-7 is only a mixed
 551.76/25.78 tradeoff at this depth, so use top-6 for the high-throughput server tier.
+For prompt-heavy workloads that can tolerate a documented quality tradeoff, top-5 repeated at
+**606.57 PP / 27.99 TG**: +6.0% PP and -1.1% TG versus top-6, with identical generated text and
+no GPU faults. Its PPL remains close at 132.0961 +/- 5.2769, but it deterministically exhausted
+the 160-token task budget before answering the bolts task. Treat top-5 as an aggressive tier,
+not a replacement for top-6. Top-4 is rejected: despite 706.43/36.52 shallow throughput, PPL
+rose to 136.6585 and it invented 110 as a prime, produced the wrong sum, and violated the
+array-only task. This is the measured lower-expert quality cliff; do not descend further.
 
 Controlled clock experiments on cards 1–3 found that 900 MHz HBM raises deterministic
 decode from 30.93 to **33.18 t/s** (+7.3%) with byte-identical output. 950 MHz did not improve
@@ -98,6 +105,9 @@ in top-8 and fixed top-8's Python alias/copy error. Top-6 reaches **629.80 PP / 
 matches top-7's task pass vector. Use top-7 for decode/latency, top-6 for prefill-heavy traffic,
 and retain top-8 when preserving the model's trained routing semantics is more important than speed.
 At four-slot 128k server shape the ranking changes: top-6 dominates both axes, while top-7 does not.
+Top-5 instead favors prefill: two exact-shape runs reached 606.38/28.40 and 606.76/27.57,
+with identical output. Expose it only when prompt throughput outweighs its repeatable bounded-task
+regression; top-6 remains the lowest general-purpose quality-gated tier.
 
 Per-op Vulkan profiling also rules out the fused GDN kernels as a large decode lever. Across
 three devices, `GATED_DELTA_NET` + `SSM_CONV_SILU` total only **1.04 ms/token**—4.0% of

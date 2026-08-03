@@ -72,6 +72,12 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   same-tier output. Use top-6 as the opt-in high-throughput four-slot tier; retain top-8 as
   the trained-routing default.
   Adding per-device queue locks to top-6 is neutral at 571.27/28.32, so keep the global lock.
+  Top-5 repeated at 606.38/28.40 and 606.76/27.57 (606.57/27.99 average), with identical
+  generated content and no GPU faults. This is an aggressive prompt-heavy tier only: PPL is
+  132.0961 +/- 5.2769, but both fresh task runs truncated the bolts answer at 160 tokens.
+  Top-4 is the stopping boundary. Although shallow speed reached 706.43/36.52, PPL rose to
+  136.6585 +/- 5.5829 and the first task run added semantic failures (110 classified as prime,
+  wrong prime sum) plus an array-only schema violation. Do not test or deploy lower counts.
 - Four-card HBM 900 is neutral (+0.36% PP/TG default queue; +0.5% PP and -1.8% TG with
   graphics), `-ub 1024` is pathological, and upstream vec-ID PR #25862 is PP-neutral.
 - The expert-count quality A/B and corrected task run are complete. Top-6 passed the narrow
@@ -132,6 +138,10 @@ f16 accumulators, `-sm row` on Vulkan (CUDA-only).
    the same bolts remainder task; top-7/top-6 fixed top-8's Python alias/copy error and introduced
    no new failure. Top-7 is the decode-biased speed tier; top-6 is prefill-biased. Top-8 remains
    the conservative trained-routing default because this suite is still bounded.
+   The lower frontier is now bounded. Top-5 has near-control PPL (+0.68%) but repeatably hits
+   `finish_reason=length` on the bolts task, so it is explicitly aggressive rather than
+   quality-gated. Top-4 raises PPL 4.16% and introduces new semantic failures; reject top-4 and
+   all lower expert counts for hosting.
 5. **llama-server graph reservation: FIXED.** Server forces `n_outputs_max=n_parallel`, which
    made one-slot Qwen decode 3.77 TG while identical `llama-completion` reached 32.47.
    `LLAMA_SERVER_FULL_OUTPUT_RESERVE=1` restores 29.70 TG and identical text. Disabling
