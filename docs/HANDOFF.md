@@ -37,6 +37,13 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   retain ub384. An explicit `-ts 0.95,1.05` layer split is catastrophic at 204.12/0.72
   and drives host memory close to exhaustion. Keep automatic placement and do not test the
   reverse split on the current host.
+- Gemma `expert_used_count=7` is quality-rejected. It measures 744.74/25.14 versus the
+  720.88/24.79 top-8 average (+3.3% PP, +1.4% TG), while streaming PPL rises from
+  1697.93 +/- 128.35 to 1853.80 +/- 140.15 (+9.2%). In two independent fresh-process
+  eight-task runs, top-7 repeatedly changed the correct exact prime response into a verbose
+  answer that hit the 160-token limit; its other two errors were shared with top-8. Do not
+  descend to top-6: the first reduction already fails the quality gate for a marginal gain.
+  The probe and task harnesses accept configurable Gemma expert counts for reproduction.
 
 ## Mission and the user's explicit targets
 

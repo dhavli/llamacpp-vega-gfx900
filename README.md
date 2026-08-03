@@ -50,6 +50,12 @@ two-card profile before making a permanent model-level rejection.
 Upstream PR #24362's GCN Flash-Attention mask change was also tested and removed. Candidate
 runs averaged 689.73/24.83 versus the 720.88/24.79 control: −4.3% PP with flat TG.
 
+Reducing Gemma's routed experts from its trained top-8 to top-7 is rejected. It raises the
+shallow profile to 744.74/25.14 (+3.3% PP, +1.4% TG), but streaming perplexity worsens from
+1697.93 to 1853.80 (+9.2%) on the same sample. More importantly, in two fresh task processes
+top-7 turned an otherwise correct exact-format prime answer into repeated 160-token
+over-explanation truncations. Keep top-8; the small speed gain does not clear the quality gate.
+
 **Qwen3.6-35B-A3B at UD-Q4_K_XL** (21.27 GiB, 256 experts / top-8, 3B active,
 30 gated-delta-net + 10 full-attention layers), split across multiple cards:
 

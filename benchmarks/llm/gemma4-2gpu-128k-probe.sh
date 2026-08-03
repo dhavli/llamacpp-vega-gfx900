@@ -14,6 +14,7 @@ n_ubatch=${UBATCH:-384}
 use_mtp=${USE_MTP:-0}
 backend_sampling=${BACKEND_SAMPLING:-0}
 tensor_split=${TENSOR_SPLIT-}
+expert_count=${EXPERT_COUNT:-8}
 
 server_args=(
     -m "${model}" -ngl 99 -fa on --no-mmap
@@ -31,6 +32,9 @@ if [[ ${backend_sampling} == 1 ]]; then
 fi
 if [[ -n ${tensor_split} ]]; then
     server_args+=(-ts "${tensor_split}")
+fi
+if [[ ${expert_count} != 8 ]]; then
+    server_args+=(--override-kv "gemma4.expert_used_count=int:${expert_count}")
 fi
 
 env GGML_VK_VISIBLE_DEVICES="${devices}" \

@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Deterministic task-quality matrix for configurable Qwen3.6 expert counts.
+# Deterministic task-quality matrix for configurable MoE expert counts.
 set -euo pipefail
 
 runtime=${RUNTIME:-/nix/store/hycp2s33y3mpv5cslr6ghly05rmm8kqy-vega-runtime}
 model=${MODEL:-/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}
 port=${PORT:-8089}
 expert_counts=${EXPERT_COUNTS:-8 7 6}
+architecture=${ARCHITECTURE:-qwen35moe}
+devices=${DEVICES:-0,1,2,3}
+n_ctx=${CONTEXT:-4096}
+n_batch=${BATCH:-2048}
+n_ubatch=${UBATCH:-768}
+tensor_split=${TENSOR_SPLIT-0.85,1.05,1.05,1.05}
+per_queue_mutex=${PER_QUEUE_MUTEX:-1}
 server_pid=
 
 cleanup() {
@@ -58,10 +65,17 @@ run_config() {
     shift
 
     echo "##### ${label} args=[$*]"
-    GGML_VK_VISIBLE_DEVICES=0,1,2,3 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
-    GGML_VK_PER_QUEUE_MUTEX=1 \
+    local server_env=(GGML_VK_VISIBLE_DEVICES="${devices}" GGML_VK_ALLOW_GRAPHICS_QUEUE=1)
+    local split_args=()
+    if [[ ${per_queue_mutex} == 1 ]]; then
+        server_env+=(GGML_VK_PER_QUEUE_MUTEX=1)
+    fi
+    if [[ -n ${tensor_split} ]]; then
+        split_args+=(-ts "${tensor_split}")
+    fi
+    env "${server_env[@]}" \
         "${runtime}/bin/llama-server" -m "${model}" -ngl 99 -fa on --no-mmap \
-        -c 4096 -np 1 -b 2048 -ub 768 -ts 0.85,1.05,1.05,1.05 \
+        -c "${n_ctx}" -np 1 -b "${n_batch}" -ub "${n_ubatch}" "${split_args[@]}" \
         --reasoning-budget 0 --reasoning-format none \
         --host 127.0.0.1 --port "${port}" "$@" \
         > "/tmp/${label}.server.log" 2>&1 &
@@ -93,7 +107,7 @@ for expert_count in ${expert_counts}; do
         run_config e8-tasks-final
     else
         run_config "e${expert_count}-tasks-final" \
-            --override-kv "qwen35moe.expert_used_count=int:${expert_count}"
+            --override-kv "${architecture}.expert_used_count=int:${expert_count}"
     fi
 done
 echo '### EXPERTTASKDONE'
