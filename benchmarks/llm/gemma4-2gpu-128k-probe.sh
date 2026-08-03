@@ -12,6 +12,8 @@ label=${LABEL:-gemma4-2gpu-128k}
 n_batch=${BATCH:-1408}
 n_ubatch=${UBATCH:-384}
 use_mtp=${USE_MTP:-0}
+backend_sampling=${BACKEND_SAMPLING:-0}
+tensor_split=${TENSOR_SPLIT-}
 
 server_args=(
     -m "${model}" -ngl 99 -fa on --no-mmap
@@ -23,6 +25,12 @@ server_args=(
 if [[ ${use_mtp} == 1 ]]; then
     server_args+=(--spec-draft-model "${draft}" --spec-type draft-mtp
         --spec-draft-n-max 4 --spec-draft-ngl 99)
+fi
+if [[ ${backend_sampling} == 1 ]]; then
+    server_args+=(--backend-sampling)
+fi
+if [[ -n ${tensor_split} ]]; then
+    server_args+=(-ts "${tensor_split}")
 fi
 
 env GGML_VK_VISIBLE_DEVICES="${devices}" \
@@ -49,11 +57,13 @@ if [[ ${ready} -ne 1 ]]; then
     exit 1
 fi
 
-body=$(jq -nc --rawfile p "${prompt}" \
-    '{prompt:$p,n_predict:128,temperature:0,ignore_eos:true,cache_prompt:false}')
+request_body="/tmp/${label}.request.json"
+jq -nc --rawfile p "${prompt}" \
+    '{prompt:$p,n_predict:128,temperature:0,ignore_eos:true,cache_prompt:false}' \
+    > "${request_body}"
 curl --fail --silent --show-error --max-time 900 \
     -X POST "http://127.0.0.1:${port}/v1/completions" \
-    -H 'Content-Type: application/json' -d "${body}" \
+    -H 'Content-Type: application/json' --data-binary "@${request_body}" \
     > "/tmp/${label}.json"
 jq -c '{prompt_tokens:.usage.prompt_tokens,generated_tokens:.usage.completion_tokens,
         pp_tps:.timings.prompt_per_second,tg_tps:.timings.predicted_per_second}' \

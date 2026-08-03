@@ -37,11 +37,18 @@ prefill-only 732.47/19.75 tradeoff. q4 KV makes b2048 fit but is slower at 600.7
 At real depth, a 121,243-token fill plus 128-token generation completes at
 **284.89 PP / 17.74 TG**, with the same deterministic completion and no GPU faults.
 Thus 128K is operational, but shallow decode must not be extrapolated to a full context.
+For interactive or reused-context traffic, add `--backend-sampling`: two shallow runs average
+701.57/27.76 (−2.7% PP, +12.0% TG), and the 121K-depth run reaches 278.75/19.16
+(−2.2% PP, +8.0% TG). Leave it off for one-shot prefill-dominated requests; enable it when
+decode latency matters and the raw completion API is compatible with backend sampling.
 
 The shipped 252 MB MTP drafter is host-RAM-blocked on this two-card 128K profile. A diagnostic
 three-card run reaches 85.96% acceptance but collapses to **378.01 PP / 5.19 TG** because
 draft calls cross the Gen2 x1 links. Keep MTP off now; after the RAM upgrade, retest the exact
 two-card profile before making a permanent model-level rejection.
+
+Upstream PR #24362's GCN Flash-Attention mask change was also tested and removed. Candidate
+runs averaged 689.73/24.83 versus the 720.88/24.79 control: −4.3% PP with flat TG.
 
 **Qwen3.6-35B-A3B at UD-Q4_K_XL** (21.27 GiB, 256 experts / top-8, 3B active,
 30 gated-delta-net + 10 full-attention layers), split across multiple cards:

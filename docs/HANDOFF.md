@@ -23,6 +23,20 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
 - Per the operator, do not continue multi-pod testing until host RAM is upgraded. Focus any
   follow-up on one two-card pod. Reproduction harness:
   `benchmarks/llm/gemma4-2gpu-128k-probe.sh`.
+- Upstream PR #24362 / commit `a646006f` (disable Vulkan FA mask optimization on GCN for
+  heads <=256) was isolated and rejected on the frozen profile. Two candidate runs averaged
+  689.73/24.83 versus the prior 720.88/24.79 control average; a fresh control returned
+  719.85/24.68. Output was identical. The reported upstream decode gain does not transfer to
+  this Q4_K_XL/b1408 shape; patch 0008 was removed.
+- Backend sampling is validated as a workload tier. Shallow repeats are 701.10/27.30 and
+  702.03/28.23 (701.57/27.76 average) versus 720.88/24.79 control: -2.7% PP, +12.0% TG.
+  At 121,243 tokens it reaches 278.75/19.16 versus 284.89/17.74: -2.2% PP, +8.0% TG.
+  Enable `--backend-sampling` for interactive/reused-context raw completions; leave it off
+  for one-shot long prefills and features incompatible with backend-side sampling.
+- Ubatch 400 is a mixed regression at 700.76/25.22 versus ub384's 720.88/24.79 average;
+  retain ub384. An explicit `-ts 0.95,1.05` layer split is catastrophic at 204.12/0.72
+  and drives host memory close to exhaustion. Keep automatic placement and do not test the
+  reverse split on the current host.
 
 ## Mission and the user's explicit targets
 
