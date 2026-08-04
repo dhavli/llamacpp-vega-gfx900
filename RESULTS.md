@@ -559,3 +559,44 @@ pathological runtime cliff as 1024 and were terminated. Batch 2560/ub640 was neu
 3200/ub640 traded higher PP for lower TG and a worse total. The final aligned b2304/ub768 probe
 reached 585.43/32.66 and 13.746 seconds with a divergent hash, so it was rejected. The bounded
 runtime matrix is exhausted; adopt `-b 2048 -ub 768`.
+
+---
+
+## 12. JetBrains Mellum2 12B-A2.5B-Thinking MoE Single-GPU Evaluation (2026-08-04)
+
+Model: `Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf` (7.03 GB, 12B params total / 2.5B active MoE).
+Single Vega 56 GPU (8 GiB VRAM), Vulkan backend, `-ctk q8_0 -ctv q8_0`, `GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill --no-mmap`.
+
+| Context Allocation (`-c`) | Prompt Tokens | Prompt Processing (PP) | Text Generation (TG) | Output SHA-256 Hash Match |
+|---|---|---|---|---|
+| **128k (`131072`)** | 5 598 | **840.67 tok/s** | **63.31 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
+| **64k (`65536`)** | 5 598 | **884.71 tok/s** | **63.97 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
+| **32k (`32768`)** | 5 598 | **747.44 tok/s** | **61.51 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
+| **16k (`16384`)** | 5 598 | **748.56 tok/s** | **61.37 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
+
+- **Highlights**:
+  - Mellum2 12B MoE allocates the **full 128k context with Q8 KV cache on a single 8GB GPU**.
+  - Reaches **840.67 PP tok/s** and **63.31 TG tok/s** at 128k context on a single 2017 Vega 56 card.
+  - Output is 100% byte-identical across all context allocations.
+
+---
+
+## 13. Gemma 4 12B Single-GPU Evaluation with Q8 MTP Drafter (2026-08-04)
+
+Model: `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` (6.71 GB).
+Drafter: `mtp-gemma-4-12B-it-Q8_0.gguf` (465 MB).
+Single Vega 56 GPU (8 GiB VRAM), `-c 16384 -ctk q8_0 -ctv q8_0 -b 1408 -ub 384`.
+
+| Configuration | MTP Draft `n_max` | Prefill (PP) | Decode (TG) | Draft Acceptance Rate | Accepted / Generated Drafts | Decode Speedup | Output SHA-256 Hash |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Solo Gemma 4 12B** | None | **233.26 tok/s** | **17.55 tok/s** | — | — | Baseline | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | 2 | 230.53 tok/s | **25.73 tok/s** | **83.16%** | 79 / 95 | **+46.6%** | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | **3** | **230.19 tok/s** | **25.91 tok/s** | **73.73%** | **87 / 118** | **+47.6%** | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | 4 | 230.23 tok/s | **25.03 tok/s** | **65.71%** | 92 / 140 | **+42.6%** | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | 5 | 229.88 tok/s | **20.47 tok/s** | **62.75%** | 96 / 153 | **+16.6%** | `38e0b9de81...` |
+
+- **Highlights**:
+  - `draft-n-max 3` yields the peak decode speedup (**25.91 TG tok/s**, **+47.6% faster** than solo 17.55 TG).
+  - Draft acceptance reaches **73.73% – 83.16%**.
+  - Output is 100% byte-identical to solo execution across all draft depths.
+
