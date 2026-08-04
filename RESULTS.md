@@ -567,16 +567,20 @@ runtime matrix is exhausted; adopt `-b 2048 -ub 768`.
 Model: `Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf` (7.03 GB, 12B params total / 2.5B active MoE).
 Single Vega 56 GPU (8 GiB VRAM), Vulkan backend, `-ctk q8_0 -ctv q8_0`, `GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill --no-mmap`.
 
-| Context Allocation (`-c`) | Prompt Tokens | Prompt Processing (PP) | Text Generation (TG) | Output SHA-256 Hash Match |
-|---|---|---|---|---|
-| **128k (`131072`)** | 5 598 | **840.67 tok/s** | **63.31 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
-| **64k (`65536`)** | 5 598 | **884.71 tok/s** | **63.97 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
-| **32k (`32768`)** | 5 598 | **747.44 tok/s** | **61.51 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
-| **16k (`16384`)** | 5 598 | **748.56 tok/s** | **61.37 tok/s** | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` |
+| Context Allocation (`-c`) | Prompt Tokens | Prompt Processing (PP) | Text Generation (TG) | VRAM Occupancy & Allocation | Output SHA-256 Hash |
+|---|:---:|:---:|:---:|---|:---:|
+| **128k (`131072`)** | 5 598 | **750.42 tok/s** | **61.08 tok/s** | ~92% VRAM (7.51 GB) — 100% VRAM Resident | `38e0b9de81...` |
+| **144k (`147456`)** | 5 598 | **731.31 tok/s** | **26.94 tok/s** | ~94% VRAM — Minor GTT spill | `38e0b9de81...` |
+| **160k (`163840`)** | 5 598 | **730.29 tok/s** | **28.53 tok/s** | ~95% VRAM — Minor GTT spill | `38e0b9de81...` |
+| **176k (`180224`)** | 5 598 | **751.29 tok/s** | **59.87 tok/s** | ~97% VRAM — High VRAM residency | `38e0b9de81...` |
+| **192k (`196608`)** | 5 598 | **723.59 tok/s** | **27.08 tok/s** | ~98% VRAM — High VRAM occupancy | `38e0b9de81...` |
+| **212k (`212992`)** | 5 598 | **668.91 tok/s** | **12.71 tok/s** | ~99% VRAM — Upper operational limit | `38e0b9de81...` |
+| **224k (`229376`)** | 5 598 | **674.17 tok/s** | **14.90 tok/s** | ~99% VRAM — Upper operational limit | `38e0b9de81...` |
+| **256k (`262144`)** | 5 598 | **92.79 tok/s** | **0.90 tok/s** | **99.9% VRAM Limit (GTT Thrashing Cliff)** | `38e0b9de81...` |
 
 - **Highlights**:
-  - Mellum2 12B MoE allocates the **full 128k context with Q8 KV cache on a single 8GB GPU**.
-  - Reaches **840.67 PP tok/s** and **63.31 TG tok/s** at 128k context on a single 2017 Vega 56 card.
+  - Mellum2 12B MoE (Q8 KV) runs up to **224k context on a single 8GB GPU** before hitting the 99%+ VRAM thrashing cliff at 256k.
+  - Sweet spot operational context window is **128k – 180k context**, delivering **750 PP tok/s** and **~60 TG tok/s**.
   - Output is 100% byte-identical across all context allocations.
 
 ---
