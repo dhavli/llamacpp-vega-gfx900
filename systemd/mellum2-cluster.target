@@ -1,0 +1,7 @@
+[Unit]
+Description=7-GPU Mellum2 12B MoE Cluster Target
+Requires=mellum2-backend@0.service mellum2-backend@1.service mellum2-backend@2.service mellum2-backend@3.service mellum2-backend@4.service mellum2-backend@5.service mellum2-backend@6.service
+After=mellum2-backend@0.service mellum2-backend@1.service mellum2-backend@2.service mellum2-backend@3.service mellum2-backend@4.service mellum2-backend@5.service mellum2-backend@6.service
+
+[Install]
+WantedBy=multi-user.target
