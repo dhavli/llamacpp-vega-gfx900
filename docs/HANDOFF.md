@@ -60,6 +60,30 @@ the rig. The prior session log lives in the repo history and `benchmarks/llm/ind
   and 17.57), so classify this as a TTFT/total-latency win rather than a decode-TPS win.
   Reproduction harness: `benchmarks/llm/gemma4-prefix-cache-probe.sh`.
 
+## Laguna-S 2.1 UD-IQ2_XXS seven-GPU probe (2026-08-03)
+
+- The prior Gemma/Qwen/MTP model files were removed from the rig. The only model file now
+  retained in `/root/models/` is `Laguna-S-2.1-UD-IQ2_XXS.gguf` (37,189,334,048 bytes;
+  SHA-256 `68adb361cdfc2d6462f3c90ec503f57872e2977f86bc269360b625b71574bfd5`).
+- The pinned project runtime rejects Laguna's `laguna` architecture. An isolated upstream
+  llama.cpp `ee0445c99` build was deployed instead, with the CPU backend constrained to SSE4.2
+  for the Vega host. It enumerates all seven Vega 56 Vulkan devices cleanly.
+- One pod is running on all seven cards (no multi-pod test):
+  `-ngl 99 --fit on -c 4096 -np 1 -b 256 -ub 128`, with graphics queue and `nogttspill`.
+  `/health` is OK and the pod is left idle on port 8099. VRAM allocation is approximately
+  4.5 GiB on card 1, 5.1–5.2 GiB on cards 2–7; no GPU faults were observed.
+- Cold model load takes about 12 minutes on this 3.7 GiB-RAM host. The mmap path read roughly
+  74 GiB from the 37 GiB file because of page-cache churn.
+- Measured single-request speed is far below the Qwen/Gemma targets. The first completion
+  logged 22-token prompt processing at **5.04 PP** and 101 generated tokens at **0.35 TG**.
+  A confirmation request measured 11-token prompt processing at **0.96 PP** (11.45 s) and
+  16-token generation at **0.381 TG** (42.02 s). The PP spread is cache-state dependent;
+  decode is consistently about 0.35–0.38 TG.
+- Primary optimization candidates: upgrade host RAM (64 GiB+ should reduce mmap thrash and
+  stabilize PP); benchmark a six-card split because seven-way PCIe/Vulkan synchronization is
+  likely dominating decode; then tune batch/ubatch only for prefill. No MTP drafter was used.
+  Do not launch three pods until the RAM upgrade.
+
 ## Mission and the user's explicit targets
 
 - Serve **Qwen3.6-35B-A3B-UD-Q4_K_XL** (21.27 GiB MoE, 256 experts top-8, arch `qwen35moe`)
