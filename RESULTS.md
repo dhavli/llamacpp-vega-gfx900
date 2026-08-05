@@ -219,7 +219,10 @@ Single-user Nix 2.35.1 now runs on the rig (nixbld group created; binaries symli
 and registered, no more silent truncation. The earlier rsync-shipped paths were
 re-registered by the first `nix copy`.
 
-## 6. Next steps, in priority order
+## 6. Archived Bonsai next steps (retired target)
+
+This 2026-07-30 list is preserved for provenance only. It is not an active work queue;
+Qwen3.6 sparse-MoE work superseded it.
 
 1. **Multi-GPU scaling.** 7 idle cards on x16 links. Layer-split 2–4 cards for Q2_0 (better
    quality) at 128k, and measure whether x16 changes the row-split calculus — my analysis
@@ -364,3 +367,240 @@ Refuted by measurement, not argument:
    anything under 5%.
 4. The RADV dump interleaves backend IR with final ISA; only ISA lines carry a `; hexcode`
    suffix. Counting IR as ISA reports max VGPR 4 — obvious nonsense, easy to believe.
+
+## 5g. HBM overdrive validation (2026-08-02)
+
+The rig now boots with `amdgpu.ppfeaturemask=0xffffffff`; the previous persistent GRUB
+source and both generated configs have timestamped backups on the rig. On cards 1–3, with
+core and memory DPM states explicitly pinned after each OD commit:
+
+| HBM clock | prompt eval | decode | deterministic output |
+|---|---:|---:|---|
+| 800 MHz | 124.03 t/s | 30.93 t/s | oracle |
+| 900 MHz | 124.64 t/s | **33.18 t/s** | byte-identical |
+
+That is +0.5% prompt and **+7.3% decode**, without new AMDGPU errors. This establishes HBM
+clock as a real decode lever despite the earlier cross-card Vega 64 comparison failing to
+show it; that comparison also changed BIOS/core characteristics and was not a controlled
+memory-clock A/B.
+
+Two harness details are mandatory on this Vega driver. `pp_od_clk_voltage` requires the
+unchanged 950 mV field (`m 3 <MHz> 950`), and committing the table silently resets DPM
+selection. The checker therefore re-pins SCLK state 7 and MCLK state 3 after every commit,
+including its cleanup back to 800 MHz. The first run without that re-pin produced an invalid
+apparent regression (30.13 → 17.51 t/s at core state 0); it is excluded from the result.
+
+The next HBM step, 950 MHz, was byte-identical but did not clear noise: 32.43 t/s versus a
+fresh 800 MHz baseline of 32.75 t/s (prompt 126.78 versus 124.64). Keep 900 MHz as the best
+proven point.
+
+A separate core-only check held HBM at 800 MHz and changed cards 1–3 from stock
+1590/1200 mV to 1700/1200 mV. It was stable, produced byte-identical output, and raised the
+short 30-token prompt rate from 123.73 to 130.30 t/s (+5.3%), but decode was flat/slightly
+lower at 33.55 versus 33.82 t/s. This is evidence to test long-prompt prefill, not sufficient
+evidence to deploy the core overclock. The cards advertise 1200 mV as their maximum; 1250 mV
+is outside the driver's OD range and was not attempted.
+
+The production-sized prefill gate then falsified that short-prompt signal. At 1590 MHz,
+pp2048 was 578.09 ± 1.44 and pp8192 was 524.39 ± 2.51. At 1700 MHz they were 583.70 ± 2.15
+(+1.0%) and 527.82 ± 3.43 (+0.7%), respectively—inside variance and far below the 6.9% clock
+increase. Combined with flat decode, 1700 MHz adds power without useful Qwen throughput and
+should not be deployed.
+
+## 5h. Four-card Qwen software/pipeline tuning (2026-08-02)
+
+The real 5,629-token top-8 workload proves that the four-card bottleneck is not clock speed.
+At the default queue/split, 800→900 MHz HBM changed 528.72/30.65 PP/TG to 530.64/30.76
+(+0.36% on both). With graphics queue it changed 529.90/34.04 to 532.59/33.43 (+0.5% PP,
+-1.8% TG). Every output was byte-identical; HBM was restored to 800 MHz.
+
+Software placement did move the result materially:
+
+| configuration | PP | TG | output |
+|---|---:|---:|---|
+| default queue and split | 528.72 | 30.65 | oracle |
+| graphics queue | 529.67 | 35.47 | identical |
+| graphics + `-ts 0.85,1.05,1.05,1.05` | **559.74** | **35.56** | identical |
+| graphics + `-ts 0.70,1.10,1.10,1.10` | 560.09 | 33.36 | identical |
+| first custom split + top-6 | **608.61** | 33.66 | semantics changed |
+
+The first custom split is the top-8 Pareto winner: +5.7% PP over graphics/default split
+without losing decode. Forward device order is mandatory; reversing `0,1,2,3` to `3,2,1,0`
+collapsed performance to 88.55 PP / 2.81 TG. `-ub 1024` became pathologically slow after
+normal model load and was terminated; retain 512.
+
+The research-led backport of upstream PR #25862 (`5cea9089`, high-expert-count vec-ID path)
+was also neutral at 528.56 PP versus 528.72 control, with identical output, and was removed.
+The next implementation step is pipeline-safe boundary/kernel tracing, not another blind
+tile sweep; see `docs/qwen4-optimization-roadmap.md`.
+
+## 5i. Pipeline-safe scheduler trace and copy-path adjudication (2026-08-03)
+
+An opt-in host-side scheduler tracer was added because Vulkan's existing per-op logger changes
+pipeline behavior. With tracing disabled, the winning four-card split measured 560.12 PP / 35.76
+TG and remained byte-identical. Trace-on prefill-only runs measured 557.17–561.74 PP, so its PP
+perturbation is small enough for boundary diagnosis; it is not suitable for TG ranking because a
+full trace-on run reduced TG by about 8%.
+
+The trace found 24 synchronous fallback copies and 46,129,200 bytes at each of the three
+downstream device boundaries. Their GPU-staged copy legs totaled roughly 0.8 seconds within a
+10.1-second prefill, setting an approximate 8% ceiling for copy-only work. Dedicated transfer
+queues did not improve either PP (562.21 versus the same ~562 trace band) or copy timings.
+
+A guarded direct copy between coherent host-visible mappings then provided a decisive negative
+control. PP collapsed to 269.31, while boundary copy time rose to 2.86, 8.53, and 0.29 seconds
+(~11.7 seconds total), versus roughly 0.26–0.29 seconds per boundary through staging. This is
+consistent with very slow CPU reads through uncached/BAR mappings on the rig. The direct-copy
+patch was removed; the diagnostic scheduler tracer remains available behind
+`GGML_SCHED_CRITICAL_TRACE=1`.
+
+The follow-up fixed-counter Vulkan shape trace is synchronization-free and did not perturb
+prefill: 558.42 PP. Across devices, Q4_K prefill generated 198–242 `MUL_MAT_ID` calls per card,
+all in the 257–512-token MM bucket. Q4_K vec calls appeared only in the 2–8-token tail (16–22
+per card). Consequently, changing the vec/MM cutoff cannot improve the main prefill workload;
+the next kernel candidate is deterministic row-ID precompaction for the MM path.
+
+That precompaction candidate was subsequently exhausted. The correctness-first implementation
+used a stable flattened-order shared prefix scan, produced byte-identical output, but regressed
+prefill to 549.02 PP. Replacing its preparation scan with the same subgroup-ballot ordering model
+already used by the production MM-ID shader restored 559.22 PP with identical output. This is
+only +0.14% over the 558.42 shape-trace control and does not clear noise or the 2% adoption gate.
+The candidate and its roughly 4 MiB/card per-ubatch scratch allocation were removed. Repeated
+routing scans are therefore not a material four-card bottleneck on this workload.
+
+Upstream PR #24720's Vulkan command-buffer cache was then ported behind
+`GGML_VK_GRAPH_REUSE=1`, with its unsafe timed eviction removed and aggregate lifecycle counters
+added. The mechanism did activate: every card recorded 13 warmups, two captures, 123 replays,
+and one invalidation during the 128-token workload. It nevertheless failed both performance and
+correctness. The same binary measured 559.23 PP / 35.46 TG with reuse off and 559.38 / 33.81 with
+reuse on (TG -4.7%). More importantly, deterministic output diverged after replay into repeated
+multilingual garbage. The full graph-reuse series was removed without further PPL/server gates;
+output corruption is already a decisive rejection.
+
+The first isolated Mesa/ACO candidate was also rejected. Backporting the single-wave workgroup
+barrier elimination (`49fb361c`) together with the required `a116cc91` execution-scope fix built
+cleanly as a separate Mesa 26.1.5 runtime and retained byte-identical output. It nevertheless
+regressed the production workload from 559.23 PP / 35.46 TG to 511.27 / 31.31: -8.6% PP and
+-11.7% TG. The isolated Mesa target and patch were removed. On this shader mix, demoting/removing
+those barriers is actively harmful rather than a small scheduling win.
+
+The broader gfx9 RADV thread-ID/shuffle series (MR43022 plus MR43240 through `f44a6b57`, excluding
+the gfx10-only tail) was then adapted to Mesa 26.1.5. Its bounded compatibility additions were the
+MR-owned `BITSET_EXTRACT64` helper and the older NIR API's explicit component-count argument. The
+full Mesa build and runtime completed, output remained byte-identical, but throughput dropped to
+507.49 PP / 31.89 TG versus 559.23 / 35.46 control (-9.3%/-10.1%). The entire isolated override
+was removed. Both credible post-26.1.5 gfx900 compiler candidates therefore regress this workload.
+
+The remaining copy-overlap candidate was implemented as a default-off, blocking two-slot pipeline.
+For cross-device transfers above 1 MiB, 1 MiB source reads alternated with destination uploads on a
+worker, preserving the generic synchronous copy contract. It moved 138,338,304 bytes in 33 copies
+and 132 chunks; diagnostic timings recorded 457 ms of reads, 516 ms of writes, 639 ms wall, and
+333 ms of overlap. The real serving A/B did not convert that overlap into an acceptable win. The
+same binary measured 560.11 PP / 35.57 TG with the pipeline off and 568.59 / 34.40 with it on:
++1.5% PP, -3.3% TG, and only 0.16% lower total request time (13.850 versus 13.828 seconds). Output
+was byte-identical. Because it misses the 2% adoption gate and harms decode, the prototype was
+removed; per-chunk thread launch and an extra host copy consume most of the theoretical benefit.
+
+The final post-pin upstream Vulkan audit identified PR #22933's GCN subgroup reduction as the
+only previously undocumented candidate with even marginal evidence. Its applicable host gate was
+already exposed by `GGML_VK_GCN_SUBGROUP_REDUCE=1`; gfx900 cannot use the PR's separate vecq
+shader work because integer dot product is absent. A same-binary production A/B measured
+561.10 PP / 35.48 TG with the knob off and 561.02 / 35.23 with it on. Total request time worsened
+0.20%, and output was byte-identical. The knob remains default-off and the candidate is exhausted.
+
+A lower-overhead copy-pipeline v2 then replaced per-chunk `std::async` launches with one ordered
+writer thread per complete tensor copy and exposed a bounded chunk-size control. At the comparable
+1 MiB size, it was byte-identical and reached 569.59 PP / 32.11 TG, but copy wall time was 645 ms
+versus v1's 639 ms; total request time regressed to 14.090 seconds. A prefill-only 512 KiB run
+doubled the chunks to 264, reached 568.53 PP, and worsened copy wall time again to 660 ms. The
+nominal overlap counter rose, proving that it is not the limiting metric: additional CPU staging
+copies and fence/submission costs consume the gain. Larger chunks necessarily reduce overlap, so
+the sweep was pruned and v2 removed. A blocking per-tensor pipeline cannot clear the 2% gate.
+
+The winning split was then resolved into discrete logical layers. With 40 transformer blocks plus
+the output layer, `0.85,1.05,1.05,1.05` maps 9/11/11/10 logical layers (9/11/11/9 blocks, with
+output on card 3). All six one-block neighbors were measured. Moving a block at either of the first
+two boundaries or from card 3 to card 2 produced only 528.47–529.94 PP. Moving block 30 from card 2
+to card 3 was the least-bad neighbor at 558.47 PP / 32.83 TG, still below the repeated center band
+around 559–561 / 35.5. Every continuation was byte-identical. The current split is therefore a
+proven one-block local optimum; continuous weight perturbations do not hide an adjacent placement.
+
+The active routed-matmul surface was finally attributed rather than inferred. With the established
+pipeline-disabled Vulkan perf logger, Q4_K `MUL_MAT_ID` consumed 2.779 of 10.027 instrumented GPU
+seconds (27.72%), so a dedicated medium-ID tile knob was justified. The prior `TILE_S` and ordinary
+`TILE_M` sweeps had never changed this pipeline. Three geometry-valid directions were tested.
+Doubling BN to 128 was byte-identical but regressed to 462.18 PP / 33.67 TG. Doubling BM to 128
+was byte-identical and fell to 406.14 PP. A two-wave 128-thread/BM32 tile appeared to win at
+626.14 PP / 35.41 TG, but diverged immediately and measured PPL 248,320.0 versus the 131.0328
+control—the vocabulary-size ceiling. It was skipping/corrupting work. The isolated knob was removed;
+the stock medium MM-ID geometry remains the only correct performant choice among the bounded set.
+
+The final runtime bracket produced one genuine win. Ubatch 384 was byte-identical but regressed to
+525.96 PP. Ubatch 576 reached 569.07 PP but lowered TG to 33.90. Ubatch 640 initially measured
+576.55 PP / 35.51 TG, with a coherent but different deterministic continuation. A new default-off
+streaming perplexity mode was added because the old verifier accumulates a half-context of logits
+and OOMs at large batches on this host. Streaming `-b128` exactly reproduced the historical
+131.0328 control; true `-b640 -ub640` measured 130.9594 +/- 5.17693, quality-equivalent.
+
+The repeat same-runtime pair measured 571.09/33.53 at ub640 versus 558.67/32.43 at ub512:
++2.22% PP, +3.39% TG, and 2.35% lower total request time. A third fail-closed run under
+`RADV_PERFTEST=nogttspill` reached 575.50 PP, reproduced the ub640 output hash, offloaded 42/42
+layers, and showed zero evicted/invalidated BOs or GPU faults. Per-process DRM accounting showed
+4.5–5.7 GiB of model VRAM per active card, the expected ~535 MiB host/staging allocation only on
+the main client, and tiny ~2.4 MiB GTT allocations on downstream clients. This established ub640
+as the first adopted improvement over ub512.
+
+The final upper bracket then promoted `-b 2048 -ub 768`. Ubatch 704 measured 582.13/35.59;
+two ub768 runs measured 584.80/35.64 and 583.34/34.93, with the same deterministic output hash
+and 13.419–13.535 second totals. True-batch streaming PPL was 131.2037 +/- 5.18752 versus the
+131.0328 control. A fail-closed ub768 run reached 585.54/34.69, retained the hash, offloaded
+42/42 layers, and showed no eviction or GPU fault. Ubatch 832 and 896 both crossed the same
+pathological runtime cliff as 1024 and were terminated. Batch 2560/ub640 was neutral, while
+3200/ub640 traded higher PP for lower TG and a worse total. The final aligned b2304/ub768 probe
+reached 585.43/32.66 and 13.746 seconds with a divergent hash, so it was rejected. The bounded
+runtime matrix is exhausted; adopt `-b 2048 -ub 768`.
+
+---
+
+## 12. JetBrains Mellum2 12B-A2.5B-Thinking MoE Single-GPU Evaluation (2026-08-04)
+
+Model: `Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf` (7.03 GB, 12B params total / 2.5B active MoE).
+Single Vega 56 GPU (8 GiB VRAM), Vulkan backend, `-ctk q8_0 -ctv q8_0`, `GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill --no-mmap`.
+
+| Context Allocation (`-c`) | Prompt Tokens | Prompt Processing (PP) | Text Generation (TG) | VRAM Occupancy & Allocation | Output SHA-256 Hash |
+|---|:---:|:---:|:---:|---|:---:|
+| **128k (`131072`)** | 5 598 | **750.42 tok/s** | **61.08 tok/s** | ~92% VRAM (7.51 GB) — 100% VRAM Resident | `38e0b9de81...` |
+| **144k (`147456`)** | 5 598 | **731.31 tok/s** | **26.94 tok/s** | ~94% VRAM — Minor GTT spill | `38e0b9de81...` |
+| **160k (`163840`)** | 5 598 | **730.29 tok/s** | **28.53 tok/s** | ~95% VRAM — Minor GTT spill | `38e0b9de81...` |
+| **176k (`180224`)** | 5 598 | **751.29 tok/s** | **59.87 tok/s** | ~97% VRAM — High VRAM residency | `38e0b9de81...` |
+| **192k (`196608`)** | 5 598 | **723.59 tok/s** | **27.08 tok/s** | ~98% VRAM — High VRAM occupancy | `38e0b9de81...` |
+| **212k (`212992`)** | 5 598 | **668.91 tok/s** | **12.71 tok/s** | ~99% VRAM — Upper operational limit | `38e0b9de81...` |
+| **224k (`229376`)** | 5 598 | **674.17 tok/s** | **14.90 tok/s** | ~99% VRAM — Upper operational limit | `38e0b9de81...` |
+| **256k (`262144`)** | 5 598 | **92.79 tok/s** | **0.90 tok/s** | **99.9% VRAM Limit (GTT Thrashing Cliff)** | `38e0b9de81...` |
+
+- **Highlights**:
+  - Mellum2 12B MoE (Q8 KV) runs up to **224k context on a single 8GB GPU** before hitting the 99%+ VRAM thrashing cliff at 256k.
+  - Sweet spot operational context window is **128k – 180k context**, delivering **750 PP tok/s** and **~60 TG tok/s**.
+  - Output is 100% byte-identical across all context allocations.
+
+---
+
+## 13. Gemma 4 12B Single-GPU Evaluation with Q8 MTP Drafter (2026-08-04)
+
+Model: `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` (6.71 GB).
+Drafter: `mtp-gemma-4-12B-it-Q8_0.gguf` (465 MB).
+Single Vega 56 GPU (8 GiB VRAM), `-c 16384 -ctk q8_0 -ctv q8_0 -b 1408 -ub 384`.
+
+| Configuration | MTP Draft `n_max` | Prefill (PP) | Decode (TG) | Draft Acceptance Rate | Accepted / Generated Drafts | Decode Speedup | Output SHA-256 Hash |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Solo Gemma 4 12B** | None | **233.26 tok/s** | **17.55 tok/s** | — | — | Baseline | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | 2 | 230.53 tok/s | **25.73 tok/s** | **83.16%** | 79 / 95 | **+46.6%** | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | **3** | **230.19 tok/s** | **25.91 tok/s** | **73.73%** | **87 / 118** | **+47.6%** | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | 4 | 230.23 tok/s | **25.03 tok/s** | **65.71%** | 92 / 140 | **+42.6%** | `38e0b9de81...` |
+| **Gemma 4 12B + Q8 Drafter** | 5 | 229.88 tok/s | **20.47 tok/s** | **62.75%** | 96 / 153 | **+16.6%** | `38e0b9de81...` |
+
+- **Highlights**:
+  - `draft-n-max 3` yields the peak decode speedup (**25.91 TG tok/s**, **+47.6% faster** than solo 17.55 TG).
+  - Draft acceptance reaches **73.73% – 83.16%**.
+  - Output is 100% byte-identical to solo execution across all draft depths.
+

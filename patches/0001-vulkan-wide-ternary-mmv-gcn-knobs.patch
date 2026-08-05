@@ -17,6 +17,10 @@ Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
 - GGML_VK_GCN_SUBGROUP_REDUCE=1: opt GCN into subgroup reductions.
 - GGML_VK_TILE_{L,M,S}: runtime warptile override (11 csv uints) for the
   dequant mmq pipelines, wg_denoms follow BM/BN.
+- GGML_VK_ENABLE_LARGE_MATMUL=1: opt GCN into the large quantized matmul and
+  routed-expert matmul pipelines for guarded A/B tuning (upstream disables them).
+- LLAMA_SERVER_FULL_OUTPUT_RESERVE=1: make server reserve the full batch graph,
+  matching llama-completion and avoiding a severe hybrid-model decode cliff.
 ---
  ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 449 +++++++++++++++++-
  .../vulkan-shaders/dequant_funcs.glsl         |  32 ++
@@ -31,7 +35,8 @@ Subject: [PATCH] vulkan: wide n==1 ternary/binary mul_mat_vec path + GCN
  src/llama-context.cpp                         |   5 +
  src/models/delta-net-base.cpp                 |  47 +-
  src/models/qwen35.cpp                         |  11 +-
- 13 files changed, 1174 insertions(+), 126 deletions(-)
+ tools/server/server-context.cpp               |   6 +
+ 14 files changed, 1180 insertions(+), 127 deletions(-)
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/sigglu.comp
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
@@ -332,7 +337,21 @@ index fd22aba..7685633 100644
          }
      }
  
-@@ -6780,8 +6963,12 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type
+@@ -6178,2 +6361,13 @@ static void ggml_vk_init_device(ggml_backend_vk_device * device, const char * na
++        // Upstream disables large matmul pipelines on AMD without cooperative
++        // matrices. Allow explicit GCN A/B testing; shared-memory validation in
++        // ggml_vk_load_shaders can still disable unsupported type variants.
++        if (device->architecture == AMD_GCN && getenv("GGML_VK_ENABLE_LARGE_MATMUL") != nullptr) {
++            for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
++                device->mul_mat_l[i] = device->mul_mat_l_int[i] = true;
++                device->mul_mat_id_l[i] = device->mul_mat_id_l_int[i] = true;
++            }
++            std::cerr << "ggml_vulkan: enabling large matmul pipelines on GCN" << std::endl;
++        }
++
+         std::vector<vk::DescriptorSetLayoutBinding> dsl_binding;
+         std::vector<vk::DescriptorBindingFlags> dsl_binding_flags;
+@@ -6780,8 +6974,12 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type
      return ctx->device->pipeline_dequant[type];
  }
  
@@ -2154,7 +2173,21 @@ index 195062d..2a08050 100644
 +    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok;
  
      ggml_tensor * state;
-     if (gdn_state_rows) {
+    if (gdn_state_rows) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 67e59b2..23d0e21 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -55,4 +55,9 @@ static uint32_t server_n_outputs_max(const common_params & params) {
+     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+-
++    // A/B hook for hybrid/recurrent models whose decode graph behaves very
++    // differently from llama-completion when server reserves only one output.
++    if (getenv("LLAMA_SERVER_FULL_OUTPUT_RESERVE") != nullptr) {
++        return n_batch;
++    }
++
+     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+ }
 -- 
 2.51.2
-

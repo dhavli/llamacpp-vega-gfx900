@@ -5,22 +5,70 @@ via llama.cpp's **Vulkan** backend (Mesa RADV + ACO) — hardware with excellent
 and no modern matrix hardware at all: **no dp4a, no int8 dot, no matrix cores, no coopmat**, and
 `v_fma_f16` at fp32 rate unless you get ACO to emit the *packed* `v_pk_fma_f16`.
 
-Test rig: 6× Vega 56/64 (8 GB HBM2 each) on a 2-core Celeron with **3.8 GB of system RAM**,
-HiveOS. Everything below was measured on that machine.
+Test rig: 7× Vega 56/64 (8 GB HBM2 each) on a 2-core Celeron with **3.8 GB of system RAM**,
+HiveOS, every card on a mining riser at **PCIe Gen2 x1 (~0.5 GB/s)**. Everything below was
+measured on that machine.
 
 ## Headline results
 
-**Bonsai-27B at Q1_0** (1-bit weights, 1.125 bpw, 3.53 GiB) — hybrid linear attention,
-48 gated-delta-net + 16 full-attention layers. Single Vega 56, deterministic greedy decode,
-output md5 verified identical at every step:
+> **Current project direction:** production work targets sparse MoE models only, beginning
+> with Qwen3.6-35B-A3B. The Bonsai Q1_0 work is retained as an experiment ledger, but its
+> prefill ceiling is not usable for this deployment and it is no longer an active hosting or
+> optimization target.
 
-| | decode (t/s) | prefill pp512 (t/s) |
-|---|---|---|
-| Stock prebuilt binary, distro Mesa 23.2 | 13.14 | 92.3 |
-| + nixpkgs Mesa 26.1 RADV (no code change) | 13.81 | 98.9 |
-| + this repo's kernels | 18.67 | 141.1 |
-| + core clock un-pinned from the mining profile (1590 MHz) | **26.06** | **206.4** |
-| Vega 64 BIOS card, 1750 MHz core / 945 MHz HBM | 24.85 | **225.9** |
+### Gemma 4 26B-A4B single-pod result
+
+`unsloth/gemma-4-26B-A4B-it-qat-GGUF` at UD-Q4_K_XL (14.249 GB) runs text-only with
+a full **128K q8 KV** allocation on two 8 GB Vega cards. The balanced server profile is:
+
+```bash
+GGML_VK_VISIBLE_DEVICES=0,1 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+RADV_PERFTEST=nogttspill LLAMA_SERVER_OUTPUT_RESERVE=128 \
+llama-server -m gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf \
+  -ngl 99 -fa on --no-mmap -c 131072 -np 1 -ctk q8_0 -ctv q8_0 \
+  -b 1408 -ub 384 --cache-ram 0 --ctx-checkpoints 0
+```
+
+On the 5,511-token prompt plus 128 generated tokens, two repeats reached
+**721.01/24.24 and 720.76/25.35 PP/TG** (720.88/24.79 average), with identical output.
+This is +21.5% PP with flat decode versus the initial b512/ub256 server control at
+593.55/24.69. Ubatch 448 is pathological (105.44/2.32), while b1536/ub384 is a
+prefill-only 732.47/19.75 tradeoff. q4 KV makes b2048 fit but is slower at 600.76/24.39.
+At real depth, a 121,243-token fill plus 128-token generation completes at
+**284.89 PP / 17.74 TG**, with the same deterministic completion and no GPU faults.
+Thus 128K is operational, but shallow decode must not be extrapolated to a full context.
+For interactive or reused-context traffic, add `--backend-sampling`, raise batch to 1536,
+and set `LLAMA_SERVER_OUTPUT_RESERVE=64`. Two shallow runs average **713.61/27.36**
+(−1.0% PP, +10.4% TG versus the conservative profile), and the 121K-depth run reaches
+**281.85/19.73** (−1.1% PP, +11.2% TG). This also dominates the earlier backend-sampling
+b1408/reserve128 tier at depth. Leave backend sampling off for one-shot prefill-dominated
+requests; use this profile when decode latency matters and the raw completion API is compatible.
+
+The shipped 252 MB MTP drafter is host-RAM-blocked on this two-card 128K profile. A diagnostic
+three-card run reaches 85.96% acceptance but collapses to **378.01 PP / 5.19 TG** because
+draft calls cross the Gen2 x1 links. Keep MTP off now; after the RAM upgrade, retest the exact
+two-card profile before making a permanent model-level rejection.
+
+Upstream PR #24362's GCN Flash-Attention mask change was also tested and removed. Candidate
+runs averaged 689.73/24.83 versus the 720.88/24.79 control: −4.3% PP with flat TG.
+
+Reducing Gemma's routed experts from its trained top-8 to top-7 is rejected. It raises the
+shallow profile to 744.74/25.14 (+3.3% PP, +1.4% TG), but streaming perplexity worsens from
+1697.93 to 1853.80 (+9.2%) on the same sample. More importantly, in two fresh task processes
+top-7 turned an otherwise correct exact-format prime answer into repeated 160-token
+over-explanation truncations. Keep top-8; the small speed gain does not clear the quality gate.
+
+The remaining Vulkan environment toggles are neutral on this profile. Two async-transfer-queue
+runs average 719.10/24.78, and two runs with host-visible VRAM disabled average 717.89/24.99;
+all completions match the control hash. Neither clears noise or the 2% adoption threshold, so
+leave both at their defaults.
+
+For multi-turn traffic, send `cache_prompt:true`. With a resident 5,511-token exact prefix,
+two fresh-process conservative-profile trials reduce the identical full request from
+12.89→8.57 seconds and 13.02→5.94 seconds (33.5–54.4%, 44.0% by average wall time), while
+reporting all 5,511 tokens reused and preserving the completion hash. The refined backend
+profile also improves 12.48→7.65 seconds (38.7%). Reused-request TG is variable and lower, so
+this is a measured TTFT/total-latency optimization, not a raw decode-throughput claim.
 
 **Qwen3.6-35B-A3B at UD-Q4_K_XL** (21.27 GiB, 256 experts / top-8, 3B active,
 30 gated-delta-net + 10 full-attention layers), split across multiple cards:
@@ -35,6 +83,100 @@ A sparse 35B at 4-bit beats a hand-tuned dense 27B at 1.125 bpw on **both** axes
 hardware — 3× the prefill and better decode — because prefill is FLOP-bound and MoE simply
 doesn't ask for the FLOPs these cards can't deliver. On 3 cards a real 5629-token prompt
 prefills at **624 t/s** and then generates at **30.8 t/s**.
+
+The best validated four-card top-8 profile combines the graphics queue with an explicit
+layer split, ubatch 768, and per-device queue locking:
+`GGML_VK_ALLOW_GRAPHICS_QUEUE=1 GGML_VK_PER_QUEUE_MUTEX=1 -ts 0.85,1.05,1.05,1.05 -ub 768`.
+On the real 5,629-token prompt, repeated ub768 runs reached **583.34–584.80 PP** and
+34.93–35.64 TG. Streaming PPL is 131.2037 versus 131.0328 control, and the fail-closed
+`nogttspill` gate reached 585.54/34.69 with no eviction or faults. See
+`docs/qwen4-optimization-roadmap.md`.
+
+The queue-lock change removes an unnecessary process-global `vkQueueSubmit` mutex while retaining
+a shared lock for wrappers that alias the same Vulkan queue. Repeated same-binary averages were
+583.95 PP / 32.77 TG with the global lock and 584.71 / 34.64 with per-device locks; the final
+`nogttspill` gate reached 583.74 / 35.56 with identical output. The upstream FLOP-based submission
+heuristic was also tested but rejected: PP regressed 1.57% and total time improved only 1.56%.
+
+For the production-shaped server with four resident 128k slots, keep automatic layer placement
+and `-ub 512`: the shallow custom split with ub640/768 fails the no-spill fit gate. With exactly
+one admitted request, adding the graphics queue raises **529.45 PP / 23.41 TG** to
+**529.63 PP / 26.95 TG**, byte-identically, restoring the 500/25 per-stream SLA.
+The quality-gated top-6 opt-in tier is faster still: two exact-shape runs averaged
+**572.26 PP / 28.31 TG**, with identical same-tier output. Top-7 is only a mixed
+551.76/25.78 tradeoff at this depth, so use top-6 for the high-throughput server tier.
+For prompt-heavy workloads that can tolerate a documented quality tradeoff, top-5 repeated at
+**606.57 PP / 27.99 TG**: +6.0% PP and -1.1% TG versus top-6, with identical generated text and
+no GPU faults. Its PPL remains close at 132.0961 +/- 5.2769, but it deterministically exhausted
+the 160-token task budget before answering the bolts task. Treat top-5 as an aggressive tier,
+not a replacement for top-6. Top-4 is rejected: despite 706.43/36.52 shallow throughput, PPL
+rose to 136.6585 and it invented 110 as a prime, produced the wrong sum, and violated the
+array-only task. This is the measured lower-expert quality cliff; do not descend further.
+
+Controlled clock experiments on cards 1–3 found that 900 MHz HBM raises deterministic
+decode from 30.93 to **33.18 t/s** (+7.3%) with byte-identical output. 950 MHz did not improve
+on that result. A 1700 MHz / 1200 mV core clock is stable and byte-identical but not useful:
+decode changed 33.82 → 33.55 t/s, pp2048 578.09 → 583.70 (+1.0%), and pp8192 524.39 →
+527.82 (+0.7%). Keep the stock core clock. The 900 MHz HBM gain is specific to the three-card
+short probe; it is neutral on the four-card production workload and should not be deployed.
+
+### Archived Bonsai result
+
+**Bonsai-27B at Q1_0** reached 26.06 t/s decode and 206.4 t/s pp512 on a Vega 56, or
+225.9 t/s pp512 on the Vega 64 BIOS card. The conventional packed-f16 prefill path is
+roofline-limited to roughly 359 t/s even at impossible 100% peak, so it cannot meet the
+serving floor. Its detailed measurements remain in `RESULTS.md`.
+
+The best safe single-stream runtime knob found so far is
+`GGML_VK_ALLOW_GRAPHICS_QUEUE=1`: on four cards it raises decode from **29.44 to 34.87 t/s**
+(+18%) with byte-identical greedy output and unchanged prefill. The gains do not add:
+combining it with `RADV_PERFTEST=nogttspill` gives 32.08 t/s, or 33.78 with the async
+transfer queue added. Pipeline parallelism was originally confirmed at `-b 2048 -ub 512`
+and remains enabled with the new ub768 profile; its diagnostic is hidden without `--verbose`.
+
+The tempting Q4_K prefill override
+`GGML_VK_TILE_M=256,128,64,64,32,64,2,4,4,1,64` is **invalid for this model**. Despite a
+19% throughput gain and roughly 140 lines of identical greedy output, its measured
+perplexity is **3,583,951 vs 131.03** for the default tile. Tile correctness is kernel-path
+specific: this value remains verified for Bonsai Q1_0, but must not be exported for Qwen.
+
+For `llama-server`, export **`LLAMA_SERVER_FULL_OUTPUT_RESERVE=1`**. Prism b9599 otherwise
+sets `n_outputs_max=n_parallel` (1 for a single slot), and the resulting graph reservation
+collapses this hybrid model to **3.77 t/s**. Reserving the full batch, as
+`llama-completion` does, restores **29.70 t/s** and raises short-prompt PP from 22.8 to 134.2,
+with identical text. Disabling server context checkpoints and its prompt cache did not change
+decode, so they were not the cause. The override is carried by this repo's patch.
+
+Reducing routed experts from top-8 to top-6 is a viable experimental quality/speed option:
+PPL is 131.42 vs 131.03 (a 0.30% delta, inside error), three deterministic tasks are
+quality-equivalent, and the long-prompt probe improves from 519.7/29.4 to 559.1/31.1 PP/TG.
+This narrow evaluation does not establish broad no-loss quality, so top-8 remains the default.
+
+The final-runtime expert frontier adds a better-balanced top-7 tier. Top-7 reaches
+**609.39 PP / 36.04 TG** with PPL 132.3556 +/- 5.2767 versus top-8's 131.2037 +/- 5.1875.
+Across two fresh-process runs of eight exact/structural tasks, top-7 introduced no failure absent
+in top-8 and fixed top-8's Python alias/copy error. Top-6 reaches **629.80 PP / 33.94 TG** and
+matches top-7's task pass vector. Use top-7 for decode/latency, top-6 for prefill-heavy traffic,
+and retain top-8 when preserving the model's trained routing semantics is more important than speed.
+At four-slot 128k server shape the ranking changes: top-6 dominates both axes, while top-7 does not.
+Top-5 instead favors prefill: two exact-shape runs reached 606.38/28.40 and 606.76/27.57,
+with identical output. Expose it only when prompt throughput outweighs its repeatable bounded-task
+regression; top-6 remains the lowest general-purpose quality-gated tier.
+The final frozen Qwen server profile replaces the boolean full-output graph reservation with
+`LLAMA_SERVER_OUTPUT_RESERVE=128`. That keeps top-6 at 572.17/29.54 and recovers enough VRAM for
+automatic-placement ub640, which reaches **579.31 PP / 29.65 TG** with identical output. Reserve
+64 regresses decode to 26.68 and ub768 still fails the fit gate.
+
+Per-op Vulkan profiling also rules out the fused GDN kernels as a large decode lever. Across
+three devices, `GATED_DELTA_NET` + `SSM_CONV_SILU` total only **1.04 ms/token**—4.0% of
+instrumented GPU-op time and 2.9% of wall time. The logger requires pipeline parallelism to
+be disabled in this revision, so absolute performance is perturbed, but even a perfect 2×
+kernel improvement would move wall time by only ~1.5%.
+
+The Qwen MoE fusion matcher does fire: perf logs contain
+`TOPK_MOE_EARLY_SOFTMAX_NORM`, and disabling all Vulkan fusion drops decode from 29.44 to
+24.87 t/s (−15.5%) with byte-identical text. The suspected view-node matcher miss is not
+present in this build; the existing fusion path should be preserved.
 
 Note the direction: MoE prefill gets **worse** with more cards (641 → 561 → 506 at pp2048),
 the opposite of the dense model, which *gained* from 3 cards at long prompts. A3B does roughly
@@ -155,7 +297,27 @@ reads *healthier* the worse the spill is. The 3-card config that works (`-c 8192
 `output.weight` (~540 MB each at Q8_0 with a 248320-token vocab) both land on the main device,
 so the split is less even than layer counts suggest.
 
-## Falsified — measured, don't repeat
+**Don't trust sysfs/lspci link speed on Vega — read the bridge, not the GPU.** Vega 10 puts a
+two-level PCIe bridge on the package, and both the GPU function's `lspci -vv LnkSta` and
+amdgpu's `current_link_speed`/`current_link_width` report the *on-die* hop — a very healthy
+"8 GT/s x16" — regardless of how the card is actually connected. The real host-facing link is
+the outermost bridge (`01:00.0`-style) to its root port, and `pp_dpm_pcie` tells the truth: on
+this rig every card offers exactly one state, `5.0GT/s, x1` — Gen2 x1 risers, ~0.5 GB/s each
+way, even for the card in the CPU's x16 slot. That's fine for layer-split *decode* (the hidden
+state is ~4 KB/token/boundary; latency dominates, not bandwidth) but each prefill ubatch moves
+megabytes per boundary through host RAM, which is part of why MoE prefill decays monotonically
+with card count.
+
+**Serving topology: fewer cards per instance wins, and host RAM is the real wall.** At an
+identical serving load (4 slots × 128k, q8_0 KV, 8k prompts) 4 cards beat 6 cards on both axes:
+prefill 471 vs 425 t/s, aggregate decode 52.2 vs 48.6 — two fewer layer boundaries is worth
+more than two extra GPUs. But capacity is card-bound (8×128k needs ~32.3 GB and does *not* fit
+4×7.98 GB), and running **two instances on disjoint cards** — the only way to scale aggregate
+prefill, since slots share one compute budget — is blocked by host RAM on a 3.8 GB box: every
+attempt was OOM-killed, **and zram does not help**. The killed processes held ~150 KB of anon
+RSS; the pressure is pinned GTT pages (Vulkan host-visible staging), which swap cannot touch.
+Budget real RAM for `n_instances × ~2.75 GB` plus page cache, or benchmarks spend ~80% of
+wall-clock re-reading the model from disk.
 
 The matvec is a well-established local optimum. All of these were built and measured, at
 1590 MHz, and lost:

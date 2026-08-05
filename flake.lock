@@ -19,17 +19,17 @@
     "prism-llamacpp": {
       "flake": false,
       "locked": {
-        "lastModified": 1784402871,
-        "narHash": "sha256-Ir3Rf3c5FqvaKu1CSR7hPi98s3gtJ/ZSD2BWaDraHqQ=",
+        "lastModified": 1785534100,
+        "narHash": "sha256-AATH4Bg0nhbuftEA1xcwAX0geVNmuBY5UWK5u2vgEYI=",
         "owner": "PrismML-Eng",
         "repo": "llama.cpp",
-        "rev": "9fcaed763ccda38ea81068ad9d7f991aaddca451",
+        "rev": "9ca265a57f85f2117942490f421f64a226dd9847",
         "type": "github"
       },
       "original": {
         "owner": "PrismML-Eng",
         "repo": "llama.cpp",
-        "rev": "9fcaed763ccda38ea81068ad9d7f991aaddca451",
+        "rev": "9ca265a57f85f2117942490f421f64a226dd9847",
         "type": "github"
       }
     },

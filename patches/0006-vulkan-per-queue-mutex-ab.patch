@@ -1,0 +1,43 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -249,4 +249,5 @@ struct vk_queue {
+     uint32_t queue_family_index;
+     vk::Queue queue;
++    std::shared_ptr<std::mutex> submit_mutex = std::make_shared<std::mutex>();
+ 
+     vk_command_pool cmd_pool;
+@@ -260,5 +261,6 @@ struct vk_queue {
+     void copyFrom(vk_queue &other) {
+         queue_family_index = other.queue_family_index;
+         queue = other.queue;
++        submit_mutex = other.submit_mutex;
+         stage_flags = other.stage_flags;
+         transfer_only = other.transfer_only;
+@@ -265,4 +267,11 @@ struct vk_queue {
+     }
+ };
+ 
++static std::mutex & ggml_vk_submit_mutex(vk_queue * queue) {
++    if (getenv("GGML_VK_PER_QUEUE_MUTEX") != nullptr) {
++        return *queue->submit_mutex;
++    }
++    return queue_mutex;
++}
++
+ static const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft);
+@@ -2626,5 +2635,5 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+     if (ctx->seqs.empty()) {
+         if (fence) {
+-            std::lock_guard<std::mutex> guard(queue_mutex);
++            std::lock_guard<std::mutex> guard(ggml_vk_submit_mutex(ctx->p->q));
+             ctx->p->q->queue.submit({}, fence);
+         }
+@@ -2696,6 +2705,6 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+         }
+     }
+ 
+-    std::lock_guard<std::mutex> guard(queue_mutex);
++    std::lock_guard<std::mutex> guard(ggml_vk_submit_mutex(ctx->p->q));
+     ctx->p->q->queue.submit(submit_infos, fence);
+ 

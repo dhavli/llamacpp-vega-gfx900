@@ -5,9 +5,13 @@
     # Full rev (from channels.nixos.org/nixpkgs-unstable) so nix fetches the
     # codeload tarball directly and never touches the rate-limited GitHub API.
     nixpkgs.url = "github:NixOS/nixpkgs/9bc02893134c733dd85de46ee4fb2fac696b5529";
-    # Pinned to the exact release running on the rig: prism-b9596-9fcaed7
+    # prism-b9599-9ca265a (2026-08-01): newest tagged prism release.
+    # vs b9596: server no longer propagates kv-mean-center bias into draft
+    # (MTP) contexts, qwen35 DSpark IGPU fix, CUDA Q2_0 __byte_perm.
+    # MTP self-spec decode (--spec-type draft-mtp, upstream PR #22673) and
+    # qwen35moe graph_mtp were already present in b9596.
     prism-llamacpp = {
-      url = "github:PrismML-Eng/llama.cpp/9fcaed763ccda38ea81068ad9d7f991aaddca451";
+      url = "github:PrismML-Eng/llama.cpp/9ca265a57f85f2117942490f421f64a226dd9847";
       flake = false;
     };
   };
@@ -29,7 +33,7 @@
 
       prism-llama-vulkan = pkgs.stdenv.mkDerivation {
         pname = "prism-llama-vulkan";
-        version = "b9596-9fcaed7${nixpkgs.lib.optionalString (patchFiles != [ ]) "-patched"}";
+        version = "b9599-9ca265a${nixpkgs.lib.optionalString (patchFiles != [ ]) "-patched"}";
         src = prism-llamacpp;
         patches = patchFiles;
 
@@ -54,7 +58,7 @@
       # ROCm/HIP build for gfx900. nixpkgs ROCm 7.x still ships gfx900 targets.
       prism-llama-rocm = pkgs.stdenv.mkDerivation {
         pname = "prism-llama-rocm";
-        version = "b9596-9fcaed7${nixpkgs.lib.optionalString (patchFiles != [ ]) "-patched"}";
+        version = "b9599-9ca265a${nixpkgs.lib.optionalString (patchFiles != [ ]) "-patched"}";
         src = prism-llamacpp;
         patches = patchFiles;
 

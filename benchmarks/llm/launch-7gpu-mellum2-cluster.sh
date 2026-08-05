@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# 7-GPU Mellum2 12B MoE Cluster Launcher (ports 8001..8007 for GPUs 0..6)
+# Direct backends for Bifrost proxy routing.
+set -euo pipefail
+
+runtime=${RUNTIME:-/nix/store/f57pns4a5iyzf54zvbr8sgr92y9s57nf-vega-runtime}
+model=${MODEL:-/root/models/Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf}
+ctx=${CTX:-131072}
+
+echo "=== Initializing 7-GPU Mellum2 12B MoE Cluster (128k context, Q8 KV) ==="
+
+pkill -9 llama-server || true
+pkill -f llm_proxy || true
+sleep 3
+
+# Launch servers sequentially with a short delay to prevent CPU contention during Vulkan init
+for gpu in $(seq 0 6); do
+    port=$((8001 + gpu))
+    label="mellum2-gpu${gpu}"
+    echo "Launching GPU ${gpu} backend on port ${port}..."
+    server_args=(
+        -m "${model}" -ngl 99 -fa on --no-mmap
+        -c "${ctx}" -np 1 -ctk q8_0 -ctv q8_0
+        -b 1408 -ub 384 --cache-ram 0 --ctx-checkpoints 0
+        --host 0.0.0.0 --port "${port}"
+    )
+    env GGML_VK_VISIBLE_DEVICES="${gpu}" \
+        GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill \
+        LLAMA_SERVER_OUTPUT_RESERVE=128 \
+        "${runtime}/bin/llama-server" "${server_args[@]}" \
+        > "/tmp/${label}.server.log" 2>&1 &
+    sleep 1.5
+done
+
+echo "Waiting for all 7 llama-server backends to reach READY status..."
+for _ in $(seq 1 60); do
+    ready_count=0
+    for gpu in $(seq 0 6); do
+        port=$((8001 + gpu))
+        if curl --silent --max-time 1 "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '"status":"ok"'; then
+            ready_count=$((ready_count + 1))
+        fi
+    done
+    echo "Ready backends: ${ready_count}/7"
+    if [[ ${ready_count} -eq 7 ]]; then
+        break
+    fi
+    sleep 3
+done
+
+echo "=== All 7 Backends Ready for Bifrost Proxy Routing (ports 8001..8007) ==="
+for gpu in $(seq 0 6); do
+    port=$((8001 + gpu))
+    echo "GPU ${gpu}: http://0.0.0.0:${port}/v1"
+done
+
+echo ""
+echo "Host RAM Usage:"
+free -h
