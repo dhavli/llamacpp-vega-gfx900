@@ -1,0 +1,17 @@
+=== Post 1 (Main Tweet) ===
+Who said 2017 AMD GPUs are dead for LLMs? 🚀
+
+Running JetBrains Mellum2 12B MoE on a single 8GB AMD RX Vega 56 via llama.cpp + Vulkan:
+
+⚡ 128,000 Context (100% inside VRAM)
+⚡ 750+ PP t/s prefill
+⚡ 60+ TG t/s decode
+⚡ ~75 MiB host RAM used
+
+On a 7-card mining rig: 440+ t/s aggregate decode across parallel streams.
+
+
+=== Post 2 (Reply Tweet with Link) ===
+Full benchmarks, single-card configs, and cluster launcher setup here 👇
+
+https://github.com/dhavli/llamacpp-vega-gfx900
