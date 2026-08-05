@@ -1,42 +1,29 @@
 # llama.cpp Vulkan Guide for AMD Radeon RX Vega 56/64 (gfx900)
 
-A straightforward guide and benchmark reference for running modern LLMs (**JetBrains Mellum2 12B MoE** and **Gemma 4 12B**) on a **single 8 GB AMD Radeon RX Vega 56/64 GPU** using `llama.cpp` with the **Vulkan** backend (Mesa RADV + ACO).
+A straightforward guide and benchmark reference for running modern LLMs (**JetBrains Mellum2 12B MoE**, **Gemma 4 12B**, and **Bonsai 27B**) on a **single 8 GB AMD Radeon RX Vega 56/64 GPU** using `llama.cpp` with the **Vulkan** backend (Mesa RADV + ACO).
 
 ---
 
-## 🚀 Key Benchmarks (Single Vega 56 GPU, 8 GB VRAM)
+## 🚀 Tested Models & Best Performance Matrix (Single Vega 56/64 GPU)
 
-### 1. JetBrains Mellum2 12B-A2.5B MoE (`MXFP4_MOE`)
-- **Model**: `Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf` (7.03 GB, 12B total / 2.5B active MoE).
-- **VRAM Footprint**: **Fits 100% in 8 GB VRAM** with **128k context & Q8 KV cache** (~7.51 GB VRAM / ~92% occupancy).
-- **Host RAM Footprint**: Uses **~75 MiB host RAM** via `--no-mmap` (runs easily on low-RAM machines).
-- **Performance**:
-  - **128k Context (`-c 131072`)**: **750.4 PP tok/s**, **61.1 TG tok/s**!
-  - **176k Context (`-c 180224`)**: **751.3 PP tok/s**, **59.9 TG tok/s**!
-  - **224k Context (`-c 229376`)**: **674.2 PP tok/s**, **14.9 TG tok/s** (Upper VRAM limit before 256k GTT thrashing).
-
-### 2. Gemma 4 12B Q4_K_XL (Solo vs Q8 Speculative Drafter)
-- **Model**: `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` (6.71 GB) + MTP Drafter `mtp-gemma-4-12B-it-Q8_0.gguf` (465 MB).
-- **Performance**:
-  - **Solo Execution**: **233.3 PP tok/s**, **17.6 TG tok/s**.
-  - **Q8 MTP Drafter (`n_max=3`)**: **230.2 PP tok/s**, **25.9 TG tok/s (+47.6% decode speedup)** at 73.7% draft acceptance!
+| Model & Quantization | Active Params | Context / KV Quant | Prefill (PP) | Decode (TG) | Optimal Runtime Configuration | Key Takeaway |
+|---|:---:|:---:|:---:|:---:|---|---|
+| **JetBrains Mellum2 12B MoE** (`MXFP4_MOE`, 7.03 GB) | **2.5B Active** / 12B Total | **128k (`Q8_0` KV)** | **750.4 tok/s** | **61.1 tok/s** (68.3 peak) | `-ngl 99 -fa on --no-mmap -c 131072 -ctk q8_0 -ctv q8_0 -b 1408 -ub 384` | **Best Overall Model**: Full 128k context in VRAM @ 61 TG/s |
+| **Gemma 4 12B Q4_K_XL** + **Q8 MTP Drafter** | 12B Dense | 16k (`Q8_0` KV) | **230.2 tok/s** | **25.9 tok/s** | `-md mtp-gemma-4-12B-it-Q8_0.gguf -draft-n-max 3 -ngl 99 -fa on --no-mmap` | **+47.6% Decode Speedup** via local single-GPU MTP drafting |
+| **Gemma 4 12B Q4_K_XL** (Solo) | 12B Dense | 16k (`Q8_0` KV) | **233.3 tok/s** | **17.6 tok/s** | `-ngl 99 -fa on --no-mmap -c 16384 -ctk q8_0 -ctv q8_0 -b 1408 -ub 384` | Baseline solo 12B dense execution |
+| **Bonsai 27B Q1_0** (`Q1_0`, 3.53 GiB) | 27B Dense | 32k (`Q4_0` KV) | **206.4 tok/s** (225.9 V64) | **26.1 tok/s** | `GGML_VK_TERNARY_LUT=1 GGML_VK_MM_PACKED=1 GGML_VK_ALLOW_GRAPHICS_QUEUE=1` | 1-bit ternary architecture with custom LDS LUT kernels |
 
 ---
 
-## 🛠️ Quickstart: How to Run Mellum2 12B on a Single Vega GPU
+## 🛠️ Model Configurations & How to Run
 
-### Prerequisites
-- AMD Radeon RX Vega 56 or Vega 64 (8 GB VRAM)
-- `llama.cpp` built with Vulkan support (`-DGGML_VULKAN=ON`)
-- Mesa RADV graphics driver (`vulkan-radeon`)
+### 1. JetBrains Mellum2 12B MoE (Best Production Choice)
+Fits **100% inside 8 GB VRAM** with **128k context and Q8 KV cache** (~7.51 GB VRAM / ~92% occupancy). Uses **~75 MiB host RAM** via `--no-mmap`.
 
-### Step 1: Download Model Weights
 ```bash
-python3 -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Thinking-GGUF-MXFP4_MOE/resolve/main/Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf', 'Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf')"
-```
+# Model download:
+# Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf (7.03 GB)
 
-### Step 2: Run `llama-server` (Single Card, 128k Context)
-```bash
 GGML_VK_VISIBLE_DEVICES=0 \
 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
 RADV_PERFTEST=nogttspill \
@@ -58,66 +45,81 @@ llama-server \
   --port 8080
 ```
 
-### Critical Flags Explained
-- `GGML_VK_VISIBLE_DEVICES=0`: Binds execution strictly to GPU 0.
-- `GGML_VK_ALLOW_GRAPHICS_QUEUE=1`: Enables graphics queue submission (+18% decode throughput on Vulkan).
-- `RADV_PERFTEST=nogttspill`: Prevents RADV from spilling VRAM allocations to system GTT memory.
-- `-ngl 99`: Offloads all 42 transformer layers into GPU VRAM.
-- `--no-mmap`: Disables memory-mapping model files into host RAM, keeping host memory usage at ~75 MiB.
-- `-c 131072 -ctk q8_0 -ctv q8_0`: Allocates 128k context with 8-bit quantized KV cache inside GPU VRAM.
-- `--cache-ram 0`: Disables host RAM prompt caching to preserve system memory.
-
 ---
 
-## ⚡ How to Run Gemma 4 12B with MTP Speculative Decoding
+### 2. Gemma 4 12B with MTP Speculative Decoding (+47.6% Speedup)
+Using the official Q8 MTP drafter on a single card eliminates PCIe latency and boosts decode speed from 17.6 to **25.9 TG tok/s**.
 
-### Solo Execution (Single Card)
 ```bash
-GGML_VK_VISIBLE_DEVICES=0 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill \
-llama-server \
-  -m gemma-4-12B-it-qat-UD-Q4_K_XL.gguf \
-  -ngl 99 -fa on --no-mmap -c 16384 -np 1 -ctk q8_0 -ctv q8_0 -b 1408 -ub 384
-```
+# Models:
+# Main: gemma-4-12B-it-qat-UD-Q4_K_XL.gguf (6.71 GB)
+# Drafter: mtp-gemma-4-12B-it-Q8_0.gguf (465 MB)
 
-### With Q8 MTP Speculative Drafter (+47.6% Speedup)
-```bash
-GGML_VK_VISIBLE_DEVICES=0 GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill \
+GGML_VK_VISIBLE_DEVICES=0 \
+GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+RADV_PERFTEST=nogttspill \
 llama-server \
   -m gemma-4-12B-it-qat-UD-Q4_K_XL.gguf \
   -md mtp-gemma-4-12B-it-Q8_0.gguf \
   -draft-n-max 3 \
-  -ngl 99 -fa on --no-mmap -c 16384 -np 1 -ctk q8_0 -ctv q8_0 -b 1408 -ub 384
+  -ngl 99 \
+  -fa on \
+  --no-mmap \
+  -c 16384 \
+  -np 1 \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  -b 1408 \
+  -ub 384
 ```
 
 ---
 
-## 📊 Full Benchmark Data
+### 3. Bonsai 27B Q1_0 (1-Bit Ternary Architecture)
+Extremely compact 27B model (3.53 GiB) fitting easily on a single 8 GB card with 32k context.
 
-### Mellum2 12B MoE Context Scaling Matrix (Single Vega 56 GPU, 8 GB VRAM)
-| Context Allocation (`-c`) | Prompt Tokens | Prompt Processing (PP) | Text Generation (TG) | VRAM Occupancy & Allocation Behavior | SHA-256 Match |
-|---|:---:|:---:|:---:|---|:---:|
-| **16k (`16384`)** | 5 598 | 748.6 tok/s | 61.4 tok/s | ~90% VRAM Resident | `38e0b9de81...` |
-| **32k (`32768`)** | 5 598 | 747.4 tok/s | 61.5 tok/s | ~91% VRAM Resident | `38e0b9de81...` |
-| **64k (`65536`)** | 5 598 | 884.7 tok/s | 64.0 tok/s | ~91.5% VRAM Resident | `38e0b9de81...` |
-| **128k (`131072`)** | 5 598 | **750.4 tok/s** | **61.1 tok/s** | **~92% VRAM Resident (7.51 GB)** | `38e0b9de81...` |
-| **176k (`180224`)** | 5 598 | **751.3 tok/s** | **59.9 tok/s** | **~97% VRAM Resident** | `38e0b9de81...` |
-| **224k (`229376`)** | 5 598 | **674.2 tok/s** | **14.9 tok/s** | **~99% VRAM Upper Limit** | `38e0b9de81...` |
-| **256k (`262144`)** | 5 598 | 92.8 tok/s | 0.9 tok/s | 99.9% VRAM GTT Thrashing Cliff | `38e0b9de81...` |
+```bash
+# Model: Bonsai-27B-Q1_0.gguf (3.80 GB / 3.53 GiB)
 
-### Gemma 4 12B Speculative Decoding Matrix
-| Configuration | Draft `n_max` | Prefill (PP) | Decode (TG) | Draft Acceptance | Decode Speedup |
-|---|:---:|:---:|:---:|:---:|:---:|
-| **Solo Gemma 4 12B** | None | **233.3 tok/s** | **17.6 tok/s** | — | Baseline |
-| **Gemma 4 12B + Q8 Drafter** | 2 | 230.5 tok/s | **25.7 tok/s** | **83.2%** | **+46.6%** |
-| **Gemma 4 12B + Q8 Drafter** | **3** | **230.2 tok/s** | **25.9 tok/s** | **73.7%** | **+47.6%** |
-| **Gemma 4 12B + Q8 Drafter** | 4 | 230.2 tok/s | **25.0 tok/s** | 65.7% | +42.6% |
-| **Gemma 4 12B + Q8 Drafter** | 5 | 229.9 tok/s | 20.5 tok/s | 62.8% | +16.6% |
+GGML_VK_VISIBLE_DEVICES=0 \
+GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+GGML_VK_MM_PACKED=1 \
+GGML_VK_TERNARY_LUT=1 \
+GGML_VK_TERNARY_PREFETCH=1 \
+GGML_VK_TERNARY_SOA=1 \
+GGML_VK_TERNARY_ROWS=8 \
+GGML_VK_GCN_SUBGROUP_REDUCE=1 \
+llama-server \
+  -m Bonsai-27B-Q1_0.gguf \
+  -ngl 99 \
+  -fa on \
+  --no-mmap \
+  -c 32768 \
+  -ctk q4_0 \
+  -ctv q4_0 \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+---
+
+## 📊 Comprehensive Context Scaling Matrix (Mellum2 12B MoE)
+
+| Context Allocation (`-c`) | Prompt Processing (PP) | Text Generation (TG) | Single-Card VRAM Occupancy | SHA-256 Match |
+|---|:---:|:---:|---|:---:|
+| **16k (`16384`)** | 748.6 tok/s | 61.4 tok/s | ~90% VRAM Resident | `38e0b9de81...` |
+| **32k (`32768`)** | 747.4 tok/s | 61.5 tok/s | ~91% VRAM Resident | `38e0b9de81...` |
+| **64k (`65536`)** | 884.7 tok/s | 64.0 tok/s | ~91.5% VRAM Resident | `38e0b9de81...` |
+| **128k (`131072`)** | **750.4 tok/s** | **61.1 tok/s** | **~92% VRAM Resident (7.51 GB)** | `38e0b9de81...` |
+| **176k (`180224`)** | **751.3 tok/s** | **59.9 tok/s** | **~97% VRAM Resident** | `38e0b9de81...` |
+| **224k (`229376`)** | **674.2 tok/s** | **14.9 tok/s** | **~99% VRAM Upper Limit** | `38e0b9de81...` |
+| **256k (`262144`)** | 92.8 tok/s | 0.9 tok/s | 99.9% VRAM GTT Thrashing Cliff | `38e0b9de81...` |
 
 ---
 
 ## 🌐 Multi-GPU Cluster Setup (7x Vega 56 for Bifrost Proxy)
 
-For multi-GPU rigs (e.g. 7x Vega GPUs on mining risers), run 7 independent single-GPU `llama-server` instances so each card handles its own 128k context stream without PCIe bottlenecking:
+To run a 7-GPU cluster where each card runs an independent 128k context instance:
 
 ```bash
 # Starts 7 llama-server backends on ports 8001..8007 (GPUs 0..6)
@@ -130,11 +132,11 @@ Bifrost proxy can route requests directly to:
 - ...
 - `http://0.0.0.0:8007/v1` (GPU 6)
 
-**Aggregate Performance**: **~440–470 TG tok/s** across 7 concurrent streams with **887 MiB free host RAM** on a 3.8 GB system.
+**Aggregate Cluster Throughput**: **~440–470 TG tok/s** across 7 concurrent streams with **887 MiB free host RAM** on a 3.8 GB system.
 
 ---
 
-## 📚 Deep-Dive Documentation
+## 📚 Technical Documentation & Deep-Dive Links
 - [ANALYSIS.md](file:///home/orchestra/orca/projects/vega-bonsai/ANALYSIS.md): Comprehensive microarchitecture deep-dive, GCN occupancy traps, Vulkan kernel optimization work, and multi-GPU pipeline analysis.
 - [RESULTS.md](file:///home/orchestra/orca/projects/vega-bonsai/RESULTS.md): Chronological experiment log and raw benchmark ledger.
 - [patches/](file:///home/orchestra/orca/projects/vega-bonsai/patches): Custom Vulkan GCN kernel patches (`0001-vulkan-wide-ternary-mmv-gcn-knobs.patch`).
