@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Robust 7-GPU Mellum2 12B MoE Cluster Launcher (ports 8001..8007 for GPUs 0..6)
-# + Zero-Dependency Multi-GPU Load Balancer Proxy on port 8000.
+# 7-GPU Mellum2 12B MoE Cluster Launcher (ports 8001..8007 for GPUs 0..6)
+# Direct backends for Bifrost proxy routing.
 set -euo pipefail
 
 runtime=${RUNTIME:-/nix/store/f57pns4a5iyzf54zvbr8sgr92y9s57nf-vega-runtime}
 model=${MODEL:-/root/models/Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf}
 ctx=${CTX:-131072}
-proxy_port=${PROXY_PORT:-8000}
 
 echo "=== Initializing 7-GPU Mellum2 12B MoE Cluster (128k context, Q8 KV) ==="
 
@@ -23,7 +22,7 @@ for gpu in $(seq 0 6); do
         -m "${model}" -ngl 99 -fa on --no-mmap
         -c "${ctx}" -np 1 -ctk q8_0 -ctv q8_0
         -b 1408 -ub 384 --cache-ram 0 --ctx-checkpoints 0
-        --host 127.0.0.1 --port "${port}"
+        --host 0.0.0.0 --port "${port}"
     )
     env GGML_VK_VISIBLE_DEVICES="${gpu}" \
         GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill \
@@ -49,12 +48,12 @@ for _ in $(seq 1 60); do
     sleep 3
 done
 
-echo "Launching Zero-Dependency Load Balancer Proxy on 0.0.0.0:${proxy_port}..."
-nohup python3 /root/bonsai/llm_proxy_stdlib.py "${proxy_port}" > /tmp/llm_proxy.log 2>&1 &
-sleep 2
+echo "=== All 7 Backends Ready for Bifrost Proxy Routing (ports 8001..8007) ==="
+for gpu in $(seq 0 6); do
+    port=$((8001 + gpu))
+    echo "GPU ${gpu}: http://0.0.0.0:${port}/v1"
+done
 
-echo "=== Final Cluster Status ==="
-curl --silent "http://127.0.0.1:${proxy_port}/health" || true
 echo ""
 echo "Host RAM Usage:"
 free -h
