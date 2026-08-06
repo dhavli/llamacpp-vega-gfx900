@@ -5,7 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Evict Linux Page Cache before starting to ensure host RAM is clean
+ExecStartPre=/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true'
 ExecStart=/usr/local/bin/mellum2-instance-runner %i
+# Drop transient loading page cache after startup completes
+ExecStartPost=/bin/sh -c 'sleep 10; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true'
 Restart=always
 RestartSec=5s
 KillMode=process
@@ -13,5 +17,11 @@ LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 
+# Enforce strict cgroup memory caps to prevent system RAM spilling
+# Model weights reside in GPU VRAM; host RAM is capped to 2 GB
+MemoryMax=2G
+MemoryHigh=1500M
+
 [Install]
 WantedBy=multi-user.target
+

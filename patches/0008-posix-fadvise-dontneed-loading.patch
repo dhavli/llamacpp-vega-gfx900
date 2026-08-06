@@ -1,0 +1,40 @@
+From 9c34d82b123456789abcdef0123456789abcdef0 Mon Sep 17 00:00:00 2001
+From: Vega benchmark harness <vega@example.invalid>
+Date: Thu, 6 Aug 2026 23:10:00 +0200
+Subject: [PATCH 0008] model-loader: advise kernel to drop page cache during model load
+
+When reading GGUF models with --no-mmap, standard fread() populates the
+Linux VFS page cache with tens of gigabytes of weight data. On hosts where physical RAM
+is smaller than the model file, this causes severe system RAM thrashing and stalls.
+This patch calls posix_fadvise(..., POSIX_FADV_DONTNEED) immediately after reading
+each chunk into host buffer, evicting the page from system RAM as soon as it is
+transferred to GPU VRAM.
+
+---
+ src/llama-model-loader.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 1234567..89abcde 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -10,6 +10,7 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include <fcntl.h>
+ 
+ void llama_file::read_raw(void * ptr, size_t size) {
+     if (size == 0) return;
+@@ -17,6 +18,10 @@ void llama_file::read_raw(void * ptr, size_t size) {
+     if (fread(ptr, 1, size, file) != size) {
+         throw std::runtime_error("read error");
+     }
++#if defined(__linux__)
++    const off_t pos = ftell(file);
++    posix_fadvise(fileno(file), pos - (off_t)size, (off_t)size, POSIX_FADV_DONTNEED);
++#endif
+ }
+ 
+-- 
+2.51.2

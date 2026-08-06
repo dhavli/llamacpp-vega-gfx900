@@ -15,6 +15,9 @@ if [[ ${stagger} -gt 0 ]]; then
     sleep "${stagger}"
 fi
 
+# Ensure Linux page cache is clean prior to model load
+sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
 echo "Starting Mellum2 12B MoE GPU ${gpu_id} Backend on port ${port} (128k context, Q8 KV)..."
 
 export GGML_VK_VISIBLE_DEVICES="${gpu_id}"
@@ -25,7 +28,7 @@ export LC_ALL=C
 
 exec "${runtime}/bin/llama-server" \
   -m "${model}" \
-  -ngl 99 \
+  -ngl 999 \
   -fit off \
   --no-warmup \
   -fa on \
@@ -40,3 +43,4 @@ exec "${runtime}/bin/llama-server" \
   --ctx-checkpoints 0 \
   --host 0.0.0.0 \
   --port "${port}"
+

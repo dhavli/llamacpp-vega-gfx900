@@ -7,6 +7,7 @@ Running JetBrains Mellum2 12B MoE on a single 8GB AMD RX Vega 56 via llama.cpp +
 ⚡ 750+ PP t/s prefill
 ⚡ 60+ TG t/s decode
 ⚡ ~75 MiB host RAM used
+⚡ 2-core Intel CPU, 4 GB RAM, 64 GB SSD -> reusing old mining rig
 
 On a 7-card mining rig: 440+ t/s aggregate decode across parallel streams.
 

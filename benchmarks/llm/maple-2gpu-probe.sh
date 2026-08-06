@@ -1,39 +1,39 @@
 #!/usr/bin/env bash
-# Qwen 3.5 122B A10B IQ3 probe for 5-GPU AMD host (5x RX 6900 XT / 80GB VRAM)
+# Benchmark probe for Maple Preview Q4_K_M (12.33 GB) across 2 Vega 56 GPUs
 set -euo pipefail
 
 runtime=${RUNTIME:-/nix/store/f57pns4a5iyzf54zvbr8sgr92y9s57nf-vega-runtime}
-model=${MODEL:-/root/models/Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf}
+model=${MODEL:-/root/models/maple-q4_k_m.gguf}
 prompt=${PROMPT:-/root/bonsai/prompt8k.txt}
-devices=${DEVICES:-0,1,2,3,4}
-port=${PORT:-8098}
-label=${LABEL:-qwen35-122b-iq3xxs-5gpu}
-n_batch=${BATCH:-4096}
-n_ubatch=${UBATCH:-768}
-n_ctx=${CTX:-131072}
-n_predict=${N_PREDICT:-128}
-expert_count=${EXPERT_COUNT:-6}
+devices=${DEVICES:-0,1}
+port=${PORT:-8096}
+ctx=${CTX:-32768}
+n_batch=${BATCH:-1408}
+n_ubatch=${UBATCH:-384}
+kv_type=${KV_TYPE:-q8_0}
+output_reserve=${OUTPUT_RESERVE:-128}
+
+label=${LABEL:-maple-q4km-2gpu-ctx${ctx}-${kv_type}}
+echo "=== Testing Maple Preview Q4_K_M (12.33 GB): CTX=${ctx}, KV=${kv_type} across 2 GPUs (${devices}) ==="
 
 server_args=(
-    -m "${model}" -ngl 999 -fit off -fa on --no-mmap
-    -c "${n_ctx}" -np 1 -ctk q4_0 -ctv q4_0
+    -m "${model}" -ngl 99 -fa on --no-mmap
+    -c "${ctx}" -np 1 -ctk "${kv_type}" -ctv "${kv_type}"
     -b "${n_batch}" -ub "${n_ubatch}"
-    --override-kv "qwen35moe.expert_used_count=int:${expert_count}"
     --cache-ram 0 --ctx-checkpoints 0
     --host 127.0.0.1 --port "${port}"
 )
 
-echo "Starting llama-server for ${label} on GPUs ${devices}..."
 env GGML_VK_VISIBLE_DEVICES="${devices}" \
     GGML_VK_ALLOW_GRAPHICS_QUEUE=1 RADV_PERFTEST=nogttspill \
-    LLAMA_SERVER_OUTPUT_RESERVE=128 \
+    LLAMA_SERVER_OUTPUT_RESERVE="${output_reserve}" \
     "${runtime}/bin/llama-server" "${server_args[@]}" \
     > "/tmp/${label}.server.log" 2>&1 &
 server_pid=$!
 trap 'kill -9 "${server_pid}" 2>/dev/null || true; wait "${server_pid}" 2>/dev/null || true' EXIT
 
 ready=0
-for _ in $(seq 1 300); do
+for _ in $(seq 1 120); do
     response=$(curl --silent --show-error --max-time 2 \
         "http://127.0.0.1:${port}/health" 2>/dev/null || true)
     if grep -q ok <<< "${response}"; then
@@ -45,18 +45,17 @@ for _ in $(seq 1 300); do
 done
 
 if [[ ${ready} -ne 1 ]]; then
-    echo "=== Server failed to start ===" >&2
-    tail -n 60 "/tmp/${label}.server.log" >&2
+    echo "=== Server FAILED to start for ${label} ==="
+    tail -n 35 "/tmp/${label}.server.log"
     exit 1
 fi
 
+echo "=== Server READY for ${label}. Running inference request... ==="
 request_body="/tmp/${label}.request.json"
 jq -nc --rawfile p "${prompt}" \
-    --argjson np "${n_predict}" \
-    '{prompt:$p,n_predict:$np,temperature:0,ignore_eos:true,cache_prompt:false}' \
+    '{prompt:$p,n_predict:128,temperature:0,ignore_eos:true,cache_prompt:false}' \
     > "${request_body}"
 
-echo "Sending completion request..."
 curl --fail --silent --show-error --max-time 900 \
     -X POST "http://127.0.0.1:${port}/v1/completions" \
     -H 'Content-Type: application/json' --data-binary "@${request_body}" \
@@ -64,6 +63,6 @@ curl --fail --silent --show-error --max-time 900 \
 
 output_hash=$(jq -r .content "/tmp/${label}.json" | sha256sum | awk '{print $1}')
 
-jq -c --arg lbl "${label}" --arg hash "${output_hash}" \
-    '{label:$lbl, prompt_tokens:.usage.prompt_tokens, generated_tokens:.usage.completion_tokens, pp_tps:.timings.prompt_per_second, tg_tps:.timings.predicted_per_second, sha256:$hash}' \
+jq -c --arg lbl "${label}" --arg hash "${output_hash}" --argjson ctx "${ctx}" --arg kv "${kv_type}" \
+    '{label:$lbl, ctx:$ctx, kv:$kv, prompt_tokens:.usage.prompt_tokens, generated_tokens:.usage.completion_tokens, pp_tps:.timings.prompt_per_second, tg_tps:.timings.predicted_per_second, sha256:$hash}' \
     "/tmp/${label}.json"
